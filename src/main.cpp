@@ -2,6 +2,7 @@
 #include <driver/twai.h>
 #include <math.h>
 
+
  
 // CAN configuration
 // ------------------------------------------------------------
@@ -39,7 +40,13 @@ constexpr uint32_t PID_TIMEOUT_MS = 80;
 // Parameter valid when at least 16 of 20 readings valid
 constexpr size_t MIN_VALID_SAMPLES = 16;
 
-// Small number used to prevent division by zero in catalyst calculations
+// Check O2 correlation from lag -3 to +3
+constexpr int MAX_O2_CORRELATION_LAG = 3;
+
+// At least 8 valid O2 pairs needed for correlation
+constexpr size_t MIN_O2_CORRELATION_PAIRS = 8;
+
+// Prevents division by zero in catalyst calculations
 constexpr float CATALYST_EPSILON = 0.000001f;
 
  
@@ -47,8 +54,7 @@ constexpr float CATALYST_EPSILON = 0.000001f;
 // ------------------------------------------------------------
 
 // Stores one complete row of vehicle data
-// Each value has a corresponding bool variable that tells us whether
-// the vehicle successfully returned a valid response for that value
+// Each value has a corresponding bool variable that tells us whether the vehicle successfully returned a valid response for that value
 struct VehicleSample
 {
     uint32_t timestampMs;
@@ -83,19 +89,19 @@ struct VehicleSample
     float o2B1S1EquivalenceRatio;
     bool o2B1S1EquivalenceRatioValid;
 
-    // O2 Bank 2 Sensor 1 = upstream O2 sensor for Bank 2 (if)
+    // O2 Bank 2 Sensor 1 = upstream O2 sensor (if available)
     float o2B2S1Voltage;
     bool o2B2S1VoltageValid;
 
-    // O2 Bank 2 Sensor 2 = downstream O2 sensor for Bank 2 (if)
+    // O2 Bank 2 Sensor 2 = downstream O2 sensor (if available)
     float o2B2S2Voltage;
     bool o2B2S2VoltageValid;
 
-    // equivalence ratio for Bank 2 Sensor 1 (if)
+    // equivalence ratio for Bank 2 Sensor 1 (if available)
     float o2B2S1EquivalenceRatio;
     bool o2B2S1EquivalenceRatioValid;
 
-    // Voltage seen by ECU's
+    // Voltage seen by the ECU
     float controlModuleVoltage;
     bool controlModuleVoltageValid;
 };
@@ -105,7 +111,7 @@ struct VehicleSample
 // Feature structures
 // ------------------------------------------------------------
 
-// Stores the basic statistics calculated from one parameter
+// Statistics calculated from one parameter
 struct ValueStatistics
 {
     bool available;
@@ -119,7 +125,7 @@ struct ValueStatistics
 };
 
 
-// Stores the twenty inputs required by the fuel model
+// Stores the 20 fuel model inputs
 struct FuelCaseFeatures
 {
     bool ready;
@@ -133,15 +139,18 @@ struct FuelCaseFeatures
 };
 
 
-// Stores the five inputs required by the catalyst model
+// Stores the 5 catalyst model inputs and separate correlation value
 struct CatalystCaseFeatures
 {
     bool ready;
     float values[5];
+
+    float maximumLaggedCorrelation;
+    bool maximumLaggedCorrelationValid;
 };
 
 
-// Stores the eleven inputs required by the battery model
+// Stores the 11 battery model inputs
 struct BatteryCaseFeatures
 {
     bool ready;
@@ -149,7 +158,7 @@ struct BatteryCaseFeatures
 };
 
 
-// Stores the intermediate catalyst calculations for one bank
+// Stores catalyst calculations for one bank
 struct CatalystBankFeatures
 {
     bool available;
@@ -161,18 +170,16 @@ struct CatalystBankFeatures
     float downstreamSwitchRange;
 };
 
-// Stores one complete non-overlapping twenty-sample case
+// Stores one non-overlapping 20-sample case
 VehicleSample caseSamples[CASE_SIZE];
 
-// Index of the next position in the twenty-sample case array
+// Next position in the 20-sample array
 size_t sampleIndex = 0;
 
-// Time at which the previous complete sample collection began
+// Time the last sample collection started
 uint32_t previousSampleTime = 0;
 
-// Response CAN ID of the ECU selected for OBD-II communication
-//
-// The value starts at zero because an ECU has not been selected yet
+// ECU response ID, starts at 0 until one responds
 uint32_t selectedEcuResponseId = 0;
 
 
@@ -180,7 +187,7 @@ uint32_t selectedEcuResponseId = 0;
 // Sample initialization
 // ------------------------------------------------------------
 
-// Resets every value and validity flag before collecting a new sample
+// Reset values before collecting a new sample
 void initializeSample(VehicleSample& sample)
 {
     sample.timestampMs = millis();
@@ -230,19 +237,14 @@ void initializeSample(VehicleSample& sample)
 // CAN receive queue handling
 // ------------------------------------------------------------
 
-// Removes any old CAN messages from the receive queue before sending
-// a new PID request
-//
-// This helps prevent an older response from being mistaken for the
-// response to the current request
+// Empty old CAN messages before a new PID request
 void clearReceiveQueue()
 {
     twai_message_t message = {};
 
-    while (twai_receive(&message, 0) == ESP_OK)
-    {
-        // Continue removing messages until the receive queue is empty
-    }
+    while (twai_receive(&message, 0) == ESP_OK) {}
+     // Continue removing messages until the receive queue is empty
+    
 }
 
 
@@ -251,15 +253,7 @@ void clearReceiveQueue()
 // ------------------------------------------------------------
 
 // Sends a Mode 01 current (live) data PID request and waits for a response
-//
-// pid:
-// The requested PID, 
-//
-// outputData:
-// 
-//
-// requiredDataBytes:
-//
+
 // Returns true when a valid response is received
 // Returns false when the request times out/fails
 bool requestMode01Pid(
@@ -294,10 +288,7 @@ bool requestMode01Pid(
     request.data[7] = 0x00;
 
     // Send PID request onto vehicle CAN bus
-    if (twai_transmit(&request, pdMS_TO_TICKS(20)) != ESP_OK)
-    {
-        return false;
-    }
+    if (twai_transmit(&request, pdMS_TO_TICKS(20)) != ESP_OK) return false;
 
     uint32_t requestStartTime = millis();
 
@@ -307,72 +298,42 @@ bool requestMode01Pid(
         twai_message_t response = {};
 
         // Wait up to ten milliseconds for the next received CAN message
-        if (twai_receive(&response, pdMS_TO_TICKS(10)) != ESP_OK)
-        {
-            continue;
-        }
+        if (twai_receive(&response, pdMS_TO_TICKS(10)) != ESP_OK) continue;
 
         // Ignore extended CAN frames and remote request frames
-        if (response.extd || response.rtr)
-        {
-            continue;
-        }
+        if (response.extd || response.rtr) continue;
+
 
         // Ignore CAN identifiers outside the standard OBD-II response range
-        if (
-            response.identifier < OBD_RESPONSE_MIN_ID ||
-            response.identifier > OBD_RESPONSE_MAX_ID)
-        {
-            continue;
-        }
+        if (response.identifier < OBD_RESPONSE_MIN_ID || response.identifier > OBD_RESPONSE_MAX_ID) continue;
+
 
         // After an ECU has been selected, ignore responses from other ECUs
-        if (
-            selectedEcuResponseId != 0 && response.identifier != selectedEcuResponseId)
-        {
-            continue;
-        }
+        if (selectedEcuResponseId != 0 && response.identifier != selectedEcuResponseId) continue;
 
-        // The response must contain:
-        // ISO-TP byte, response mode, PID and requested data bytes
-        if (response.data_length_code < 3 + requiredDataBytes)
-        {
-            continue;
-        }
+        // The response must contain ISO-TP byte, response mode, PID, and requested data bytes
+        if (response.data_length_code < 3 + requiredDataBytes) continue;
 
         // The upper four bits being zero indicates an ISO-TP single frame
-        if ((response.data[0] & 0xF0) != 0x00)
-        {
-            continue;
-        }
+        if ((response.data[0] & 0xF0) != 0x00) continue;
+
 
         // Lower four bits contain the ISO-TP payload length
         uint8_t payloadLength = response.data[0] & 0x0F;
 
         // Payload contains response mode, PID and returned data bytes
-        if (payloadLength < 2 + requiredDataBytes)
-        {
-            continue;
-        }
+        if (payloadLength < 2 + requiredDataBytes) continue;
 
         // A Mode 01 request returns response mode 0x41
-        //
         // The returned PID must also match the requested PID
-        if (
-            response.data[1] != 0x41 ||
-            response.data[2] != pid)
-        {
-            continue;
-        }
+        if (response.data[1] != 0x41 || response.data[2] != pid) continue;
 
         // The first ECU that returns a valid response is selected
         if (selectedEcuResponseId == 0)
         {
             selectedEcuResponseId = response.identifier;
 
-            Serial.printf(
-                "Selected ECU response ID: 0x%03lX\n",
-                static_cast<unsigned long>(selectedEcuResponseId));
+            Serial.printf( "Selected ECU response ID: 0x%03lX\n", static_cast<unsigned long>(selectedEcuResponseId));
         }
 
         // Copy the returned PID data bytes into the output array
@@ -509,9 +470,7 @@ void collectOneSample(VehicleSample& sample)
 
 
     // PID 08: Short-term fuel trim, Bank 2
-    //
-    // Four-cylinder engines normally do not have Bank 2, so this PID
-    // may be unsupported on many vehicles
+    // Four-cylinder engines normally do not have Bank 2, so this PID may be unsupported on many vehicles
     if (requestMode01Pid(0x08, data, 1))
     {
         sample.stftB2 = decodeFuelTrim(data[0]);
@@ -536,76 +495,57 @@ void collectOneSample(VehicleSample& sample)
 
 
     // PID 14: O2 Sensor 1
-    //
-    // In the normal two-bank layout this is Bank 1 Sensor 1,
-    // which is the upstream O2 sensor
+    // In the normal two-bank layout this is Bank 1 Sensor 1, which is the upstream O2 sensor
     if (requestMode01Pid(0x14, data, 2))
     {
-        sample.o2B1S1Voltage =
-            decodeNarrowbandO2Voltage(data[0]);
+        sample.o2B1S1Voltage = decodeNarrowbandO2Voltage(data[0]);
 
         sample.o2B1S1VoltageValid = true;
     }
 
 
     // PID 15: O2 Sensor 2
-    //
-    // In the normal two-bank layout this is Bank 1 Sensor 2,
-    // which is the downstream O2 sensor
+    // In the normal two-bank layout this is Bank 1 Sensor 2, which is the downstream O2 sensor
     if (requestMode01Pid(0x15, data, 2))
     {
-        sample.o2B1S2Voltage =
-            decodeNarrowbandO2Voltage(data[0]);
+        sample.o2B1S2Voltage = decodeNarrowbandO2Voltage(data[0]);
 
         sample.o2B1S2VoltageValid = true;
     }
 
 
     // PID 18: O2 Sensor 5
-    //
-    // In the normal two-bank layout this is Bank 2 Sensor 1,
-    // which is the upstream O2 sensor for Bank 2
+    // In the normal two-bank layout this is Bank 2 Sensor 1, which is the upstream O2 sensor for Bank 2
     if (requestMode01Pid(0x18, data, 2))
     {
-        sample.o2B2S1Voltage =
-            decodeNarrowbandO2Voltage(data[0]);
+        sample.o2B2S1Voltage = decodeNarrowbandO2Voltage(data[0]);
 
         sample.o2B2S1VoltageValid = true;
     }
 
 
     // PID 19: O2 Sensor 6
-    //
-    // In the normal two-bank layout this is Bank 2 Sensor 2,
-    // which is the downstream O2 sensor for Bank 2
+    // In the normal two-bank layout this is Bank 2 Sensor 2, which is the downstream O2 sensor for Bank 2
     if (requestMode01Pid(0x19, data, 2))
     {
-        sample.o2B2S2Voltage =
-            decodeNarrowbandO2Voltage(data[0]);
+        sample.o2B2S2Voltage = decodeNarrowbandO2Voltage(data[0]);
 
         sample.o2B2S2VoltageValid = true;
     }
 
 
     // PID 24: Wideband O2 Sensor 1
-    //
     // Normally represents Bank 1 Sensor 1 in a two-bank layout
     if (requestMode01Pid(0x24, data, 4))
     {
-        sample.o2B1S1EquivalenceRatio =
-            decodeWidebandEquivalenceRatio(
-                data[0],
-                data[1]);
+        sample.o2B1S1EquivalenceRatio = decodeWidebandEquivalenceRatio( data[0], data[1]);
 
         sample.o2B1S1EquivalenceRatioValid = true;
 
         // Use the wideband voltage when narrowband PID 14 was unavailable
         if (!sample.o2B1S1VoltageValid)
         {
-            sample.o2B1S1Voltage =
-                decodeWidebandVoltage(
-                    data[2],
-                    data[3]);
+            sample.o2B1S1Voltage = decodeWidebandVoltage(data[2], data[3]);
 
             sample.o2B1S1VoltageValid = true;
         }
@@ -613,41 +553,30 @@ void collectOneSample(VehicleSample& sample)
 
 
     // PID 25: Wideband O2 Sensor 2
-    //
-    // Used as a fallback for Bank 1 downstream voltage when PID 15
-    // was unavailable
+    // Used as a fallback for Bank 1 downstream voltage when PID 15 was unavailable
     if (
         !sample.o2B1S2VoltageValid &&
         requestMode01Pid(0x25, data, 4))
     {
-        sample.o2B1S2Voltage =
-            decodeWidebandVoltage(
-                data[2],
-                data[3]);
+        sample.o2B1S2Voltage = decodeWidebandVoltage(data[2], data[3]);
 
         sample.o2B1S2VoltageValid = true;
     }
 
 
     // PID 28: Wideband O2 Sensor 5
-    //
     // Normally represents Bank 2 Sensor 1 in a two-bank layout
     if (requestMode01Pid(0x28, data, 4))
     {
         sample.o2B2S1EquivalenceRatio =
-            decodeWidebandEquivalenceRatio(
-                data[0],
-                data[1]);
+            decodeWidebandEquivalenceRatio(data[0], data[1]);
 
         sample.o2B2S1EquivalenceRatioValid = true;
 
         // Use wideband voltage when narrowband PID 18 was unavailable
         if (!sample.o2B2S1VoltageValid)
         {
-            sample.o2B2S1Voltage =
-                decodeWidebandVoltage(
-                    data[2],
-                    data[3]);
+            sample.o2B2S1Voltage = decodeWidebandVoltage(data[2], data[3]);
 
             sample.o2B2S1VoltageValid = true;
         }
@@ -655,17 +584,12 @@ void collectOneSample(VehicleSample& sample)
 
 
     // PID 29: Wideband O2 Sensor 6
-    //
-    // Used as a fallback for Bank 2 downstream voltage when PID 19
-    // was unavailable
+    // Used as a fallback for Bank 2 downstream voltage when PID 19 was unavailable
     if (
         !sample.o2B2S2VoltageValid &&
         requestMode01Pid(0x29, data, 4))
     {
-        sample.o2B2S2Voltage =
-            decodeWidebandVoltage(
-                data[2],
-                data[3]);
+        sample.o2B2S2Voltage = decodeWidebandVoltage(data[2], data[3]);
 
         sample.o2B2S2VoltageValid = true;
     }
@@ -674,10 +598,7 @@ void collectOneSample(VehicleSample& sample)
     // PID 42: Control-module voltage
     if (requestMode01Pid(0x42, data, 2))
     {
-        sample.controlModuleVoltage =
-            decodeControlModuleVoltage(
-                data[0],
-                data[1]);
+        sample.controlModuleVoltage = decodeControlModuleVoltage(data[0],data[1]);
 
         sample.controlModuleVoltageValid = true;
     }
@@ -689,25 +610,16 @@ void collectOneSample(VehicleSample& sample)
 // ------------------------------------------------------------
 
 // Prints a floating-point value when it is valid
-//
 // Prints NA when the vehicle did not return a valid value
 void printValue(float value, bool valid)
 {
-    if (valid)
-    {
-        Serial.print(value, 2);
-    }
-    else
-    {
-        Serial.print("NA");
-    }
+    if (valid) Serial.print(value, 2);
+    else Serial.print("NA");
 }
 
 
 // Prints one complete sample in CSV format
-void printSample(
-    const VehicleSample& sample,
-    size_t index)
+void printSample(const VehicleSample& sample, size_t index)
 {
     Serial.print(index);
     Serial.print(',');
@@ -715,69 +627,43 @@ void printSample(
     Serial.print(sample.timestampMs);
     Serial.print(',');
 
-    printValue(
-        sample.engineLoad,
-        sample.engineLoadValid);
+    printValue(sample.engineLoad, sample.engineLoadValid);
     Serial.print(',');
 
-    printValue(
-        sample.stftB1,
-        sample.stftB1Valid);
+    printValue(sample.stftB1, sample.stftB1Valid);
     Serial.print(',');
 
-    printValue(
-        sample.ltftB1,
-        sample.ltftB1Valid);
+    printValue(sample.ltftB1, sample.ltftB1Valid);
     Serial.print(',');
 
-    printValue(
-        sample.stftB2,
-        sample.stftB2Valid);
+    printValue(sample.stftB2, sample.stftB2Valid);
     Serial.print(',');
 
-    printValue(
-        sample.ltftB2,
-        sample.ltftB2Valid);
+    printValue(sample.ltftB2, sample.ltftB2Valid);
     Serial.print(',');
 
-    printValue(
-        sample.rpm,
-        sample.rpmValid);
+    printValue(sample.rpm, sample.rpmValid);
     Serial.print(',');
 
-    printValue(
-        sample.o2B1S1Voltage,
-        sample.o2B1S1VoltageValid);
+    printValue(sample.o2B1S1Voltage, sample.o2B1S1VoltageValid);
     Serial.print(',');
 
-    printValue(
-        sample.o2B1S2Voltage,
-        sample.o2B1S2VoltageValid);
+    printValue(sample.o2B1S2Voltage, sample.o2B1S2VoltageValid);
     Serial.print(',');
 
-    printValue(
-        sample.o2B1S1EquivalenceRatio,
-        sample.o2B1S1EquivalenceRatioValid);
+    printValue(sample.o2B1S1EquivalenceRatio, sample.o2B1S1EquivalenceRatioValid);
     Serial.print(',');
 
-    printValue(
-        sample.o2B2S1Voltage,
-        sample.o2B2S1VoltageValid);
+    printValue(sample.o2B2S1Voltage, sample.o2B2S1VoltageValid);
     Serial.print(',');
 
-    printValue(
-        sample.o2B2S2Voltage,
-        sample.o2B2S2VoltageValid);
+    printValue(sample.o2B2S2Voltage, sample.o2B2S2VoltageValid);
     Serial.print(',');
 
-    printValue(
-        sample.o2B2S1EquivalenceRatio,
-        sample.o2B2S1EquivalenceRatioValid);
+    printValue(sample.o2B2S1EquivalenceRatio, sample.o2B2S1EquivalenceRatioValid);
     Serial.print(',');
 
-    printValue(
-        sample.controlModuleVoltage,
-        sample.controlModuleVoltageValid);
+    printValue(sample.controlModuleVoltage, sample.controlModuleVoltageValid);
 
     Serial.println();
 }
@@ -787,11 +673,8 @@ void printSample(
 // General statistics calculation
 // ------------------------------------------------------------
 
-// Calculates the mean, population standard deviation, minimum,
-// maximum and range from the valid values in one case
-ValueStatistics calculateStatistics(
-    const float values[CASE_SIZE],
-    const bool validValues[CASE_SIZE])
+// Calculates mean, population STD, min, max, and range
+ValueStatistics calculateStatistics(const float values[CASE_SIZE], const bool validValues[CASE_SIZE])
 {
     ValueStatistics result = {};
 
@@ -806,13 +689,10 @@ ValueStatistics calculateStatistics(
 
     double sum = 0.0;
 
-    // First pass calculates count, sum, minimum and maximum
+    // First pass: count, sum, min, and max
     for (size_t i = 0; i < CASE_SIZE; i++)
     {
-        if (!validValues[i] || !isfinite(values[i]))
-        {
-            continue;
-        }
+        if (!validValues[i] || !isfinite(values[i])) continue;
 
         float currentValue = values[i];
 
@@ -823,59 +703,36 @@ ValueStatistics calculateStatistics(
         }
         else
         {
-            if (currentValue < result.minimum)
-            {
-                result.minimum = currentValue;
-            }
+            if (currentValue < result.minimum) result.minimum = currentValue;
 
-            if (currentValue > result.maximum)
-            {
-                result.maximum = currentValue;
-            }
+            if (currentValue > result.maximum) result.maximum = currentValue;
         }
 
         sum += currentValue;
         result.validCount++;
     }
 
-    // No statistics can be calculated when every reading is invalid
-    if (result.validCount == 0)
-    {
-        return result;
-    }
+    // No valid readings
+    if (result.validCount == 0) return result;
 
-    result.mean =
-        static_cast<float>(
-            sum / result.validCount);
+    result.mean = static_cast<float>(sum / result.validCount);
 
     double squaredDifferenceSum = 0.0;
 
     // Second pass calculates population standard deviation
-    //
-    // The training data used ddof = 0, so the divisor is the
-    // number of valid readings rather than valid readings minus one
+    // The training data used ddof = 0, so the divisor is the number of valid readings rather than valid readings minus one
     for (size_t i = 0; i < CASE_SIZE; i++)
     {
-        if (!validValues[i] || !isfinite(values[i]))
-        {
-            continue;
-        }
+        if (!validValues[i] || !isfinite(values[i])) continue;
 
-        double difference =
-            values[i] - result.mean;
+        double difference = values[i] - result.mean;
 
-        squaredDifferenceSum +=
-            difference * difference;
+        squaredDifferenceSum += difference * difference;
     }
 
-    result.standardDeviation =
-        static_cast<float>(
-            sqrt(
-                squaredDifferenceSum /
-                result.validCount));
+    result.standardDeviation = static_cast<float>(sqrt(squaredDifferenceSum / result.validCount));
 
-    result.range =
-        result.maximum - result.minimum;
+    result.range = result.maximum - result.minimum;
 
     result.available = true;
 
@@ -887,10 +744,8 @@ ValueStatistics calculateStatistics(
 // Fuel feature calculation
 // ------------------------------------------------------------
 
-// Creates the twenty features required by the fuel
-// Logistic Regression model
-FuelCaseFeatures calculateFuelFeatures(
-    const VehicleSample samples[CASE_SIZE])
+// Creates the 20 fuel features
+FuelCaseFeatures calculateFuelFeatures(const VehicleSample samples[CASE_SIZE])
 {
     FuelCaseFeatures result = {};
 
@@ -928,9 +783,7 @@ FuelCaseFeatures calculateFuelFeatures(
     bool absoluteTotalTrimB2Valid[CASE_SIZE];
 
 
-    // Copy the raw sample values into individual arrays
-    //
-    // Total trim equals STFT plus LTFT from the same bank
+    // Copy raw values into arrays. Total trim = STFT + LTFT from the same bank
     for (size_t i = 0; i < CASE_SIZE; i++)
     {
         rpmValues[i] = samples[i].rpm;
@@ -946,22 +799,17 @@ FuelCaseFeatures calculateFuelFeatures(
         ltftB1Values[i] = samples[i].ltftB1;
         ltftB1Valid[i] = samples[i].ltftB1Valid;
 
-        totalTrimB1Valid[i] =
-            samples[i].stftB1Valid &&
-            samples[i].ltftB1Valid;
+        totalTrimB1Valid[i] = samples[i].stftB1Valid && samples[i].ltftB1Valid;
 
-        absoluteTotalTrimB1Valid[i] =
-            totalTrimB1Valid[i];
+        absoluteTotalTrimB1Valid[i] = totalTrimB1Valid[i];
 
         if (totalTrimB1Valid[i])
         {
-            totalTrimB1Values[i] =
-                samples[i].stftB1 +
-                samples[i].ltftB1;
+            totalTrimB1Values[i] = samples[i].stftB1 + samples[i].ltftB1;
 
-            absoluteTotalTrimB1Values[i] =
-                fabs(totalTrimB1Values[i]);
+            absoluteTotalTrimB1Values[i] = fabs(totalTrimB1Values[i]);
         }
+
         else
         {
             totalTrimB1Values[i] = NAN;
@@ -975,22 +823,17 @@ FuelCaseFeatures calculateFuelFeatures(
         ltftB2Values[i] = samples[i].ltftB2;
         ltftB2Valid[i] = samples[i].ltftB2Valid;
 
-        totalTrimB2Valid[i] =
-            samples[i].stftB2Valid &&
-            samples[i].ltftB2Valid;
+        totalTrimB2Valid[i] = samples[i].stftB2Valid && samples[i].ltftB2Valid;
 
-        absoluteTotalTrimB2Valid[i] =
-            totalTrimB2Valid[i];
+        absoluteTotalTrimB2Valid[i] = totalTrimB2Valid[i];
 
         if (totalTrimB2Valid[i])
         {
-            totalTrimB2Values[i] =
-                samples[i].stftB2 +
-                samples[i].ltftB2;
+            totalTrimB2Values[i] = samples[i].stftB2 + samples[i].ltftB2;
 
-            absoluteTotalTrimB2Values[i] =
-                fabs(totalTrimB2Values[i]);
+            absoluteTotalTrimB2Values[i] = fabs(totalTrimB2Values[i]);
         }
+
         else
         {
             totalTrimB2Values[i] = NAN;
@@ -999,105 +842,64 @@ FuelCaseFeatures calculateFuelFeatures(
     }
 
 
-    ValueStatistics rpm =
-        calculateStatistics(
-            rpmValues,
-            rpmValid);
+    ValueStatistics rpm = calculateStatistics(rpmValues, rpmValid);
 
-    ValueStatistics load =
-        calculateStatistics(
-            loadValues,
-            loadValid);
+    ValueStatistics load = calculateStatistics(loadValues, loadValid);
 
+    ValueStatistics stftB1 = calculateStatistics(stftB1Values, stftB1Valid);
 
-    ValueStatistics stftB1 =
-        calculateStatistics(
-            stftB1Values,
-            stftB1Valid);
+    ValueStatistics ltftB1 = calculateStatistics(ltftB1Values, ltftB1Valid);
 
-    ValueStatistics ltftB1 =
-        calculateStatistics(
-            ltftB1Values,
-            ltftB1Valid);
+    ValueStatistics totalTrimB1 = calculateStatistics(totalTrimB1Values,totalTrimB1Valid);
 
-    ValueStatistics totalTrimB1 =
-        calculateStatistics(
-            totalTrimB1Values,
-            totalTrimB1Valid);
-
-    ValueStatistics absoluteTotalTrimB1 =
-        calculateStatistics(
-            absoluteTotalTrimB1Values,
-            absoluteTotalTrimB1Valid);
+    ValueStatistics absoluteTotalTrimB1 = calculateStatistics(absoluteTotalTrimB1Values, absoluteTotalTrimB1Valid);
 
 
-    ValueStatistics stftB2 =
-        calculateStatistics(
-            stftB2Values,
-            stftB2Valid);
+    ValueStatistics stftB2 = calculateStatistics(stftB2Values, stftB2Valid);
 
-    ValueStatistics ltftB2 =
-        calculateStatistics(
-            ltftB2Values,
-            ltftB2Valid);
+    ValueStatistics ltftB2 = calculateStatistics(ltftB2Values, ltftB2Valid);
 
-    ValueStatistics totalTrimB2 =
-        calculateStatistics(
-            totalTrimB2Values,
-            totalTrimB2Valid);
+    ValueStatistics totalTrimB2 = calculateStatistics(totalTrimB2Values, totalTrimB2Valid);
 
-    ValueStatistics absoluteTotalTrimB2 =
-        calculateStatistics(
-            absoluteTotalTrimB2Values,
-            absoluteTotalTrimB2Valid);
+    ValueStatistics absoluteTotalTrimB2 = calculateStatistics(absoluteTotalTrimB2Values,absoluteTotalTrimB2Valid);
 
 
-    bool bank1Reliable =
-        absoluteTotalTrimB1.validCount >=
-        MIN_VALID_SAMPLES;
+    bool bank1Reliable = absoluteTotalTrimB1.validCount >= MIN_VALID_SAMPLES;
 
-    bool bank2Reliable =
-        absoluteTotalTrimB2.validCount >=
-        MIN_VALID_SAMPLES;
+    bool bank2Reliable = absoluteTotalTrimB2.validCount >= MIN_VALID_SAMPLES;
 
 
-    // Bank 2 is selected only when it is available and its
-    // average absolute total trim is worse than Bank 1
-    bool useBank2 =
-        bank2Reliable &&
-        (
-            !bank1Reliable ||
-            absoluteTotalTrimB2.mean >
-            absoluteTotalTrimB1.mean
-        );
+    // Bank 2 is selected only when it is available and its average absolute total trim is worse than Bank 1
+    bool useBank2 = bank2Reliable && ( !bank1Reliable || absoluteTotalTrimB2.mean > absoluteTotalTrimB1.mean );
 
 
-    if (!bank1Reliable && !bank2Reliable)
+    if (!bank1Reliable && !bank2Reliable) return result;
+
+    ValueStatistics selectedStft;
+    ValueStatistics selectedLtft;
+    ValueStatistics selectedTotalTrim;
+    ValueStatistics selectedAbsoluteTotalTrim;
+
+    // Select all fuel trim statistics from the same bank
+    if (useBank2)
     {
-        return result;
+        selectedStft = stftB2;
+        selectedLtft = ltftB2;
+        selectedTotalTrim = totalTrimB2;
+        selectedAbsoluteTotalTrim = absoluteTotalTrimB2;
+        result.selectedBank = 2;
+    }
+    else
+    {
+        selectedStft = stftB1;
+        selectedLtft = ltftB1;
+        selectedTotalTrim = totalTrimB1;
+        selectedAbsoluteTotalTrim = absoluteTotalTrimB1;
+        result.selectedBank = 1;
     }
 
 
-    const ValueStatistics& selectedStft =
-        useBank2 ? stftB2 : stftB1;
-
-    const ValueStatistics& selectedLtft =
-        useBank2 ? ltftB2 : ltftB1;
-
-    const ValueStatistics& selectedTotalTrim =
-        useBank2 ? totalTrimB2 : totalTrimB1;
-
-    const ValueStatistics& selectedAbsoluteTotalTrim =
-        useBank2
-            ? absoluteTotalTrimB2
-            : absoluteTotalTrimB1;
-
-
-    result.selectedBank =
-        useBank2 ? 2 : 1;
-
-
-    // Exact feature order used by the fuel model
+    // Fuel feature order used during training
 
     result.values[0] = rpm.mean;
     result.values[1] = rpm.standardDeviation;
@@ -1121,12 +923,9 @@ FuelCaseFeatures calculateFuelFeatures(
     result.values[15] = selectedTotalTrim.maximum;
 
     result.values[16] = selectedAbsoluteTotalTrim.mean;
-    result.values[17] =
-        selectedAbsoluteTotalTrim.standardDeviation;
-    result.values[18] =
-        selectedAbsoluteTotalTrim.minimum;
-    result.values[19] =
-        selectedAbsoluteTotalTrim.maximum;
+    result.values[17] = selectedAbsoluteTotalTrim.standardDeviation;
+    result.values[18] = selectedAbsoluteTotalTrim.minimum;
+    result.values[19] = selectedAbsoluteTotalTrim.maximum;
 
 
     result.ready =
@@ -1144,7 +943,7 @@ FuelCaseFeatures calculateFuelFeatures(
 // Catalyst bank feature calculation
 // ------------------------------------------------------------
 
-// Calculates the catalyst behavior features for one bank
+// Calculates catalyst features for one bank
 CatalystBankFeatures calculateCatalystBankFeatures(
     const ValueStatistics& upstreamVoltage,
     const ValueStatistics& upstreamEquivalenceRatio,
@@ -1154,99 +953,48 @@ CatalystBankFeatures calculateCatalystBankFeatures(
 
     result.available = false;
 
-    bool voltageReliable =
-        upstreamVoltage.validCount >=
-        MIN_VALID_SAMPLES;
+    bool voltageReliable = upstreamVoltage.validCount >= MIN_VALID_SAMPLES;
 
-    bool equivalenceRatioReliable =
-        upstreamEquivalenceRatio.validCount >=
-        MIN_VALID_SAMPLES;
+    bool equivalenceRatioReliable = upstreamEquivalenceRatio.validCount >= MIN_VALID_SAMPLES;
 
-    bool downstreamReliable =
-        downstreamVoltage.validCount >=
-        MIN_VALID_SAMPLES;
+    bool downstreamReliable = downstreamVoltage.validCount >= MIN_VALID_SAMPLES;
 
 
     // Upstream voltage is preferred
-    //
     // Equivalence ratio is used when upstream voltage is unavailable
-    if (
-        (!voltageReliable && !equivalenceRatioReliable) ||
-        !downstreamReliable)
+    if ((!voltageReliable && !equivalenceRatioReliable) || !downstreamReliable) return result;
+
+    ValueStatistics upstream;
+
+    if (voltageReliable)
     {
-        return result;
+        upstream = upstreamVoltage;
+    }
+    else
+    {
+        upstream = upstreamEquivalenceRatio;
     }
 
 
-    const ValueStatistics& upstream =
-        voltageReliable
-            ? upstreamVoltage
-            : upstreamEquivalenceRatio;
+    float upstreamRelativeStandardDeviation = upstream.standardDeviation / (fabs(upstream.mean) + CATALYST_EPSILON);
+
+    float upstreamRelativeRange = upstream.range / (fabs(upstream.mean) + CATALYST_EPSILON);
+
+    float downstreamRelativeStandardDeviation = downstreamVoltage.standardDeviation / (fabs(downstreamVoltage.mean) + CATALYST_EPSILON);
+
+    float downstreamRelativeRange = downstreamVoltage.range / (fabs(downstreamVoltage.mean) + CATALYST_EPSILON);
 
 
-    float upstreamRelativeStandardDeviation =
-        upstream.standardDeviation /
-        (
-            fabs(upstream.mean) +
-            CATALYST_EPSILON
-        );
+    result.standardDeviationSimilarityGap = fabs(log((downstreamRelativeStandardDeviation + CATALYST_EPSILON) / (upstreamRelativeStandardDeviation + CATALYST_EPSILON)));
 
-    float upstreamRelativeRange =
-        upstream.range /
-        (
-            fabs(upstream.mean) +
-            CATALYST_EPSILON
-        );
+    result.rangeSimilarityGap = fabs(log((downstreamRelativeRange + CATALYST_EPSILON) / (upstreamRelativeRange + CATALYST_EPSILON)));
 
-    float downstreamRelativeStandardDeviation =
-        downstreamVoltage.standardDeviation /
-        (
-            fabs(downstreamVoltage.mean) +
-            CATALYST_EPSILON
-        );
+    result.downstreamRelativeStandardDeviation = downstreamRelativeStandardDeviation;
 
-    float downstreamRelativeRange =
-        downstreamVoltage.range /
-        (
-            fabs(downstreamVoltage.mean) +
-            CATALYST_EPSILON
-        );
+    result.downstreamRelativeRange = downstreamRelativeRange;
 
-
-    result.standardDeviationSimilarityGap =
-        fabs(
-            log(
-                (
-                    downstreamRelativeStandardDeviation +
-                    CATALYST_EPSILON
-                ) /
-                (
-                    upstreamRelativeStandardDeviation +
-                    CATALYST_EPSILON
-                )));
-
-    result.rangeSimilarityGap =
-        fabs(
-            log(
-                (
-                    downstreamRelativeRange +
-                    CATALYST_EPSILON
-                ) /
-                (
-                    upstreamRelativeRange +
-                    CATALYST_EPSILON
-                )));
-
-    result.downstreamRelativeStandardDeviation =
-        downstreamRelativeStandardDeviation;
-
-    result.downstreamRelativeRange =
-        downstreamRelativeRange;
-
-    // The switch range used during training is downstream maximum
-    // minus downstream minimum
-    result.downstreamSwitchRange =
-        downstreamVoltage.range;
+    // Downstream switch range = max - min
+    result.downstreamSwitchRange = downstreamVoltage.range;
 
     result.available = true;
 
@@ -1254,17 +1002,133 @@ CatalystBankFeatures calculateCatalystBankFeatures(
 }
 
 
- 
+
+// O2 correlation calculation
+// ------------------------------------------------------------
+
+// Calculates upstream/downstream O2 correlation at one lag
+bool calculateCorrelationAtLag(const float upstreamValues[CASE_SIZE], const bool upstreamValid[CASE_SIZE], const float downstreamValues[CASE_SIZE], const bool downstreamValid[CASE_SIZE], int downstreamLag, float& correlationOutput)
+{
+    double upstreamSum = 0.0;
+    double downstreamSum = 0.0;
+    size_t pairCount = 0;
+
+    // First pass gets the paired averages
+    for (int upstreamIndex = 0; upstreamIndex < static_cast<int>(CASE_SIZE); upstreamIndex++)
+    {
+        int downstreamIndex = upstreamIndex - downstreamLag;
+
+        // Skip rows shifted outside the 20-sample case
+        if (downstreamIndex < 0 || downstreamIndex >= static_cast<int>(CASE_SIZE))
+        {
+            continue;
+        }
+
+        // Only use rows where both O2 readings are valid
+        if (!upstreamValid[upstreamIndex] || !downstreamValid[downstreamIndex] || !isfinite(upstreamValues[upstreamIndex]) || !isfinite(downstreamValues[downstreamIndex]))
+        {
+            continue;
+        }
+
+        upstreamSum += upstreamValues[upstreamIndex];
+        downstreamSum += downstreamValues[downstreamIndex];
+        pairCount++;
+    }
+
+    if (pairCount < MIN_O2_CORRELATION_PAIRS)
+    {
+        return false;
+    }
+
+    double upstreamMean = upstreamSum / pairCount;
+
+    double downstreamMean = downstreamSum / pairCount;
+
+    double covarianceSum = 0.0;
+    double upstreamDifferenceSum = 0.0;
+    double downstreamDifferenceSum = 0.0;
+
+    // Second pass calculates Pearson correlation
+    for (int upstreamIndex = 0; upstreamIndex < static_cast<int>(CASE_SIZE); upstreamIndex++)
+    {
+        int downstreamIndex = upstreamIndex - downstreamLag;
+
+        if (downstreamIndex < 0 || downstreamIndex >= static_cast<int>(CASE_SIZE))
+        {
+            continue;
+        }
+
+        if (!upstreamValid[upstreamIndex] || !downstreamValid[downstreamIndex] || !isfinite(upstreamValues[upstreamIndex]) || !isfinite(downstreamValues[downstreamIndex]))
+        {
+            continue;
+        }
+
+        double upstreamDifference = upstreamValues[upstreamIndex] - upstreamMean;
+
+        double downstreamDifference = downstreamValues[downstreamIndex] - downstreamMean;
+
+        covarianceSum += upstreamDifference * downstreamDifference;
+
+        upstreamDifferenceSum += upstreamDifference * upstreamDifference;
+
+        downstreamDifferenceSum += downstreamDifference * downstreamDifference;
+    }
+
+    // Cannot calculate correlation if one signal did not change
+    if (upstreamDifferenceSum <= 0.0 || downstreamDifferenceSum <= 0.0)
+    {
+        return false;
+    }
+
+    correlationOutput = static_cast<float>(covarianceSum / sqrt(upstreamDifferenceSum * downstreamDifferenceSum));
+
+    return isfinite(correlationOutput);
+}
+
+
+// Checks lag -3 through +3 and keeps the highest correlation
+bool calculateMaximumLaggedCorrelation(const float upstreamValues[CASE_SIZE], const bool upstreamValid[CASE_SIZE], const float downstreamValues[CASE_SIZE], const bool downstreamValid[CASE_SIZE], float& maximumCorrelationOutput)
+{
+    bool correlationFound = false;
+    float maximumCorrelation = -1.0f;
+
+    for (int lag = -MAX_O2_CORRELATION_LAG; lag <= MAX_O2_CORRELATION_LAG; lag++)
+    {
+        float currentCorrelation = NAN;
+
+        if (!calculateCorrelationAtLag(upstreamValues, upstreamValid, downstreamValues, downstreamValid, lag, currentCorrelation))
+        {
+            continue;
+        }
+
+        if (!correlationFound || currentCorrelation > maximumCorrelation)
+        {
+            maximumCorrelation = currentCorrelation;
+            correlationFound = true;
+        }
+    }
+
+    if (!correlationFound)
+    {
+        return false;
+    }
+
+    maximumCorrelationOutput = maximumCorrelation;
+    return true;
+}
+
+
+
 // Catalyst feature calculation
 // ------------------------------------------------------------
 
-// Creates the five features required by the catalyst
-// Isolation Forest model
-CatalystCaseFeatures calculateCatalystFeatures(
-    const VehicleSample samples[CASE_SIZE])
+// Creates the 5 catalyst model features and O2 correlation value
+CatalystCaseFeatures calculateCatalystFeatures(const VehicleSample samples[CASE_SIZE])
 {
     CatalystCaseFeatures result = {};
     result.ready = false;
+    result.maximumLaggedCorrelation = NAN;
+    result.maximumLaggedCorrelationValid = false;
 
     float upstreamB1VoltageValues[CASE_SIZE];
     bool upstreamB1VoltageValid[CASE_SIZE];
@@ -1288,88 +1152,50 @@ CatalystCaseFeatures calculateCatalystFeatures(
 
     for (size_t i = 0; i < CASE_SIZE; i++)
     {
-        upstreamB1VoltageValues[i] =
-            samples[i].o2B1S1Voltage;
+        upstreamB1VoltageValues[i] = samples[i].o2B1S1Voltage;
 
-        upstreamB1VoltageValid[i] =
-            samples[i].o2B1S1VoltageValid;
+        upstreamB1VoltageValid[i] = samples[i].o2B1S1VoltageValid;
 
-        upstreamB1EquivalenceValues[i] =
-            samples[i].o2B1S1EquivalenceRatio;
+        upstreamB1EquivalenceValues[i] = samples[i].o2B1S1EquivalenceRatio;
 
-        upstreamB1EquivalenceValid[i] =
-            samples[i].o2B1S1EquivalenceRatioValid;
+        upstreamB1EquivalenceValid[i] = samples[i].o2B1S1EquivalenceRatioValid;
 
-        downstreamB1VoltageValues[i] =
-            samples[i].o2B1S2Voltage;
+        downstreamB1VoltageValues[i] = samples[i].o2B1S2Voltage;
 
-        downstreamB1VoltageValid[i] =
-            samples[i].o2B1S2VoltageValid;
+        downstreamB1VoltageValid[i] = samples[i].o2B1S2VoltageValid;
 
 
-        upstreamB2VoltageValues[i] =
-            samples[i].o2B2S1Voltage;
+        upstreamB2VoltageValues[i] = samples[i].o2B2S1Voltage;
 
-        upstreamB2VoltageValid[i] =
-            samples[i].o2B2S1VoltageValid;
+        upstreamB2VoltageValid[i] = samples[i].o2B2S1VoltageValid;
 
-        upstreamB2EquivalenceValues[i] =
-            samples[i].o2B2S1EquivalenceRatio;
+        upstreamB2EquivalenceValues[i] = samples[i].o2B2S1EquivalenceRatio;
 
-        upstreamB2EquivalenceValid[i] =
-            samples[i].o2B2S1EquivalenceRatioValid;
+        upstreamB2EquivalenceValid[i] = samples[i].o2B2S1EquivalenceRatioValid;
 
-        downstreamB2VoltageValues[i] =
-            samples[i].o2B2S2Voltage;
+        downstreamB2VoltageValues[i] = samples[i].o2B2S2Voltage;
 
-        downstreamB2VoltageValid[i] =
-            samples[i].o2B2S2VoltageValid;
+        downstreamB2VoltageValid[i] = samples[i].o2B2S2VoltageValid;
     }
 
 
-    ValueStatistics upstreamB1Voltage =
-        calculateStatistics(
-            upstreamB1VoltageValues,
-            upstreamB1VoltageValid);
+    ValueStatistics upstreamB1Voltage = calculateStatistics(upstreamB1VoltageValues, upstreamB1VoltageValid);
 
-    ValueStatistics upstreamB1Equivalence =
-        calculateStatistics(
-            upstreamB1EquivalenceValues,
-            upstreamB1EquivalenceValid);
+    ValueStatistics upstreamB1Equivalence = calculateStatistics(upstreamB1EquivalenceValues, upstreamB1EquivalenceValid);
 
-    ValueStatistics downstreamB1Voltage =
-        calculateStatistics(
-            downstreamB1VoltageValues,
-            downstreamB1VoltageValid);
+    ValueStatistics downstreamB1Voltage = calculateStatistics(downstreamB1VoltageValues, downstreamB1VoltageValid);
 
 
-    ValueStatistics upstreamB2Voltage =
-        calculateStatistics(
-            upstreamB2VoltageValues,
-            upstreamB2VoltageValid);
+    ValueStatistics upstreamB2Voltage = calculateStatistics(upstreamB2VoltageValues, upstreamB2VoltageValid);
 
-    ValueStatistics upstreamB2Equivalence =
-        calculateStatistics(
-            upstreamB2EquivalenceValues,
-            upstreamB2EquivalenceValid);
+    ValueStatistics upstreamB2Equivalence = calculateStatistics(upstreamB2EquivalenceValues, upstreamB2EquivalenceValid);
 
-    ValueStatistics downstreamB2Voltage =
-        calculateStatistics(
-            downstreamB2VoltageValues,
-            downstreamB2VoltageValid);
+    ValueStatistics downstreamB2Voltage = calculateStatistics(downstreamB2VoltageValues, downstreamB2VoltageValid);
 
 
-    CatalystBankFeatures bank1 =
-        calculateCatalystBankFeatures(
-            upstreamB1Voltage,
-            upstreamB1Equivalence,
-            downstreamB1Voltage);
+    CatalystBankFeatures bank1 = calculateCatalystBankFeatures(upstreamB1Voltage, upstreamB1Equivalence, downstreamB1Voltage);
 
-    CatalystBankFeatures bank2 =
-        calculateCatalystBankFeatures(
-            upstreamB2Voltage,
-            upstreamB2Equivalence,
-            downstreamB2Voltage);
+    CatalystBankFeatures bank2 = calculateCatalystBankFeatures(upstreamB2Voltage, upstreamB2Equivalence, downstreamB2Voltage);
 
 
     if (!bank1.available && !bank2.available)
@@ -1380,51 +1206,89 @@ CatalystCaseFeatures calculateCatalystFeatures(
 
     if (bank1.available && bank2.available)
     {
-        result.values[0] =
-            min(
-                bank1.standardDeviationSimilarityGap,
-                bank2.standardDeviationSimilarityGap);
+        result.values[0] = min(bank1.standardDeviationSimilarityGap, bank2.standardDeviationSimilarityGap);
 
-        result.values[1] =
-            min(
-                bank1.rangeSimilarityGap,
-                bank2.rangeSimilarityGap);
+        result.values[1] = min(bank1.rangeSimilarityGap, bank2.rangeSimilarityGap);
 
-        result.values[2] =
-            max(
-                bank1.downstreamRelativeStandardDeviation,
-                bank2.downstreamRelativeStandardDeviation);
+        result.values[2] = max(bank1.downstreamRelativeStandardDeviation, bank2.downstreamRelativeStandardDeviation);
 
-        result.values[3] =
-            max(
-                bank1.downstreamRelativeRange,
-                bank2.downstreamRelativeRange);
+        result.values[3] = max(bank1.downstreamRelativeRange, bank2.downstreamRelativeRange);
 
-        result.values[4] =
-            max(
-                bank1.downstreamSwitchRange,
-                bank2.downstreamSwitchRange);
+        result.values[4] = max(bank1.downstreamSwitchRange, bank2.downstreamSwitchRange);
     }
     else
     {
-        const CatalystBankFeatures& selectedBank =
-            bank1.available ? bank1 : bank2;
+        CatalystBankFeatures selectedBank;
 
-        result.values[0] =
-            selectedBank.standardDeviationSimilarityGap;
+        if (bank1.available)
+        {
+            selectedBank = bank1;
+        }
+        else
+        {
+            selectedBank = bank2;
+        }
 
-        result.values[1] =
-            selectedBank.rangeSimilarityGap;
+        result.values[0] = selectedBank.standardDeviationSimilarityGap;
 
-        result.values[2] =
-            selectedBank.downstreamRelativeStandardDeviation;
+        result.values[1] = selectedBank.rangeSimilarityGap;
 
-        result.values[3] =
-            selectedBank.downstreamRelativeRange;
+        result.values[2] = selectedBank.downstreamRelativeStandardDeviation;
 
-        result.values[4] =
-            selectedBank.downstreamSwitchRange;
+        result.values[3] = selectedBank.downstreamRelativeRange;
+
+        result.values[4] = selectedBank.downstreamSwitchRange;
     }
+
+
+    // Calculate B1 correlation using voltage first, then equivalence ratio
+    float bank1Correlation = NAN;
+    bool bank1CorrelationValid = false;
+
+    if (upstreamB1Voltage.validCount >= MIN_O2_CORRELATION_PAIRS)
+    {
+        bank1CorrelationValid = calculateMaximumLaggedCorrelation(upstreamB1VoltageValues, upstreamB1VoltageValid, downstreamB1VoltageValues, downstreamB1VoltageValid, bank1Correlation);
+    }
+    else if (upstreamB1Equivalence.validCount >= MIN_O2_CORRELATION_PAIRS)
+    {
+        bank1CorrelationValid = calculateMaximumLaggedCorrelation(upstreamB1EquivalenceValues, upstreamB1EquivalenceValid, downstreamB1VoltageValues, downstreamB1VoltageValid, bank1Correlation);
+    }
+
+
+    // Do the same for B2 if the vehicle has it
+    float bank2Correlation = NAN;
+    bool bank2CorrelationValid = false;
+
+    if (upstreamB2Voltage.validCount >= MIN_O2_CORRELATION_PAIRS)
+    {
+        bank2CorrelationValid = calculateMaximumLaggedCorrelation(upstreamB2VoltageValues, upstreamB2VoltageValid, downstreamB2VoltageValues, downstreamB2VoltageValid, bank2Correlation);
+    }
+    else if (upstreamB2Equivalence.validCount >= MIN_O2_CORRELATION_PAIRS)
+    {
+        bank2CorrelationValid = calculateMaximumLaggedCorrelation(upstreamB2EquivalenceValues, upstreamB2EquivalenceValid, downstreamB2VoltageValues, downstreamB2VoltageValid, bank2Correlation);
+    }
+
+
+    // Keep whichever bank had the higher valid correlation
+    if (bank1CorrelationValid && bank2CorrelationValid)
+    {
+        result.maximumLaggedCorrelation = max(bank1Correlation, bank2Correlation);
+
+        result.maximumLaggedCorrelationValid = true;
+    }
+    else if (bank1CorrelationValid)
+    {
+        result.maximumLaggedCorrelation = bank1Correlation;
+
+        result.maximumLaggedCorrelationValid = true;
+    }
+    else if (bank2CorrelationValid)
+    {
+        result.maximumLaggedCorrelation = bank2Correlation;
+
+        result.maximumLaggedCorrelationValid = true;
+    }
+
 
     result.ready = true;
 
@@ -1432,14 +1296,12 @@ CatalystCaseFeatures calculateCatalystFeatures(
 }
 
 
- 
+
 // Battery feature calculation
 // ------------------------------------------------------------
 
-// Creates the eleven features required by the battery
-// Isolation Forest model
-BatteryCaseFeatures calculateBatteryFeatures(
-    const VehicleSample samples[CASE_SIZE])
+// Creates the 11 battery features
+BatteryCaseFeatures calculateBatteryFeatures(const VehicleSample samples[CASE_SIZE])
 {
     BatteryCaseFeatures result = {};
     result.ready = false;
@@ -1455,19 +1317,16 @@ BatteryCaseFeatures calculateBatteryFeatures(
 
     for (size_t i = 0; i < CASE_SIZE; i++)
     {
-        voltageValues[i] =
-            samples[i].controlModuleVoltage;
+        voltageValues[i] = samples[i].controlModuleVoltage;
 
-        voltageValid[i] =
-            samples[i].controlModuleVoltageValid;
+        voltageValid[i] = samples[i].controlModuleVoltageValid;
 
         if (!voltageValid[i])
         {
             continue;
         }
 
-        float voltage =
-            samples[i].controlModuleVoltage;
+        float voltage = samples[i].controlModuleVoltage;
 
         if (voltage < 12.8f)
         {
@@ -1491,21 +1350,16 @@ BatteryCaseFeatures calculateBatteryFeatures(
     }
 
 
-    ValueStatistics voltage =
-        calculateStatistics(
-            voltageValues,
-            voltageValid);
+    ValueStatistics voltage = calculateStatistics(voltageValues, voltageValid);
 
 
-    if (
-        voltage.validCount <
-        MIN_VALID_SAMPLES)
+    if (voltage.validCount < MIN_VALID_SAMPLES)
     {
         return result;
     }
 
 
-    // Exact feature order used by the battery model
+    // Battery feature order used during training
 
     result.values[0] = voltage.mean;
     result.values[1] = voltage.standardDeviation;
@@ -1514,24 +1368,18 @@ BatteryCaseFeatures calculateBatteryFeatures(
 
     result.values[4] = voltage.range;
 
-    // VOLTAGE_RANGE and CONTROL_MODULE_VOLTAGE_V_RANGE
-    // are duplicate columns in the training feature table
+    // VOLTAGE_RANGE and CONTROL_MODULE_VOLTAGE_V_RANGE are duplicate columns in the training feature table
     result.values[5] = voltage.range;
 
-    result.values[6] =
-        fabs(voltage.mean - 14.0f);
+    result.values[6] = fabs(voltage.mean - 14.0f);
 
-    result.values[7] =
-        static_cast<float>(lowVoltageCount);
+    result.values[7] = static_cast<float>(lowVoltageCount);
 
-    result.values[8] =
-        static_cast<float>(highVoltageCount);
+    result.values[8] = static_cast<float>(highVoltageCount);
 
-    result.values[9] =
-        static_cast<float>(belowChargingCount);
+    result.values[9] = static_cast<float>(belowChargingCount);
 
-    result.values[10] =
-        static_cast<float>(aboveChargingCount);
+    result.values[10] = static_cast<float>(aboveChargingCount);
 
     result.ready = true;
 
@@ -1539,49 +1387,35 @@ BatteryCaseFeatures calculateBatteryFeatures(
 }
 
 
- 
+
 // Feature printing
 // ------------------------------------------------------------
 
-// Prints a feature name and value
-void printFeature(
-    const char* featureName,
-    float featureValue)
+// Prints one feature
+void printFeature(const char* featureName, float featureValue)
 {
     Serial.print(featureName);
     Serial.print(": ");
-    Serial.println(featureValue);
+    Serial.println(featureValue, 6);
 }
 
 
- 
+
 // Completed case processing
 // ------------------------------------------------------------
 
-// Called after all twenty samples have been collected
-//
-// Feature calculations and ML inference will be added here later
- 
-// Completed case processing
-// ------------------------------------------------------------
-
-// Calculates and prints all model features after twenty samples
-// have been collected
-void processCompletedCase(
-    const VehicleSample samples[CASE_SIZE])
+// Calculates and prints all features after 20 samples
+void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 {
     Serial.println();
     Serial.println("=== 20-SAMPLE CASE COMPLETE ===");
 
 
-    FuelCaseFeatures fuelFeatures =
-        calculateFuelFeatures(samples);
+    FuelCaseFeatures fuelFeatures = calculateFuelFeatures(samples);
 
-    CatalystCaseFeatures catalystFeatures =
-        calculateCatalystFeatures(samples);
+    CatalystCaseFeatures catalystFeatures = calculateCatalystFeatures(samples);
 
-    BatteryCaseFeatures batteryFeatures =
-        calculateBatteryFeatures(samples);
+    BatteryCaseFeatures batteryFeatures = calculateBatteryFeatures(samples);
 
 
     // --------------------------------------------------------
@@ -1593,8 +1427,7 @@ void processCompletedCase(
 
     if (!fuelFeatures.ready)
     {
-        Serial.println(
-            "Fuel feature data is incomplete.");
+        Serial.println("Fuel feature data is incomplete.");
     }
     else
     {
@@ -1631,9 +1464,7 @@ void processCompletedCase(
 
         for (size_t i = 0; i < 20; i++)
         {
-            printFeature(
-                fuelFeatureNames[i],
-                fuelFeatures.values[i]);
+            printFeature(fuelFeatureNames[i], fuelFeatures.values[i]);
         }
     }
 
@@ -1647,8 +1478,7 @@ void processCompletedCase(
 
     if (!catalystFeatures.ready)
     {
-        Serial.println(
-            "Catalyst feature data is incomplete.");
+        Serial.println("Catalyst feature data is incomplete.");
     }
     else
     {
@@ -1663,9 +1493,16 @@ void processCompletedCase(
 
         for (size_t i = 0; i < 5; i++)
         {
-            printFeature(
-                catalystFeatureNames[i],
-                catalystFeatures.values[i]);
+            printFeature(catalystFeatureNames[i], catalystFeatures.values[i]);
+        }
+
+        if (catalystFeatures.maximumLaggedCorrelationValid)
+        {
+            printFeature("MAX_UPSTREAM_DOWNSTREAM_O2_CORRELATION", catalystFeatures.maximumLaggedCorrelation);
+        }
+        else
+        {
+            Serial.println("MAX_UPSTREAM_DOWNSTREAM_O2_CORRELATION: NA");
         }
     }
 
@@ -1679,8 +1516,7 @@ void processCompletedCase(
 
     if (!batteryFeatures.ready)
     {
-        Serial.println(
-            "Battery feature data is incomplete.");
+        Serial.println("Battery feature data is incomplete.");
     }
     else
     {
@@ -1701,9 +1537,7 @@ void processCompletedCase(
 
         for (size_t i = 0; i < 11; i++)
         {
-            printFeature(
-                batteryFeatureNames[i],
-                batteryFeatures.values[i]);
+            printFeature(batteryFeatureNames[i], batteryFeatures.values[i]);
         }
     }
 
@@ -1715,18 +1549,14 @@ void processCompletedCase(
 }
 
 
- 
+
 // TWAI controller initialization
 // ------------------------------------------------------------
 
-// Installs and starts the ESP32 TWAI controller at 500 kbit/s
+// Starts TWAI at 500 kbit/s
 bool initializeCan()
 {
-    twai_general_config_t generalConfig =
-        TWAI_GENERAL_CONFIG_DEFAULT(
-            CAN_TX_PIN,
-            CAN_RX_PIN,
-            TWAI_MODE_NORMAL);
+    twai_general_config_t generalConfig = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
 
     // Number of outgoing CAN messages that can wait in the transmit queue
     generalConfig.tx_queue_len = 10;
@@ -1735,21 +1565,14 @@ bool initializeCan()
     generalConfig.rx_queue_len = 40;
 
     // Configure the CAN bus for 500 kbit/s
-    twai_timing_config_t timingConfig =
-        TWAI_TIMING_CONFIG_500KBITS();
+    twai_timing_config_t timingConfig = TWAI_TIMING_CONFIG_500KBITS();
 
     // Initially accept every CAN message
-    //
     // The request function later checks the identifier and response contents
-    twai_filter_config_t filterConfig =
-        TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    twai_filter_config_t filterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     // Install the TWAI driver
-    if (
-        twai_driver_install(
-            &generalConfig,
-            &timingConfig,
-            &filterConfig) != ESP_OK)
+    if (twai_driver_install(&generalConfig, &timingConfig, &filterConfig) != ESP_OK)
     {
         Serial.println("Failed to install the TWAI driver.");
         return false;
@@ -1769,7 +1592,7 @@ bool initializeCan()
 }
 
 
- 
+
 // setup
 // ------------------------------------------------------------
 
@@ -1803,7 +1626,7 @@ void setup()
 }
 
 
- 
+
 // main loop
 // ------------------------------------------------------------
 
@@ -1838,8 +1661,7 @@ void loop()
     {
         processCompletedCase(caseSamples);
 
-        // Reset to the beginning of the array for a new
-        // non-overlapping twenty-sample case
+        // Reset to the beginning of the array for a new non-overlapping twenty-sample case
         sampleIndex = 0;
     }
 }
