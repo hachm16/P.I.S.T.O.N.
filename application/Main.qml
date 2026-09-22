@@ -1853,30 +1853,46 @@ ApplicationWindow {
                     required property string modelData
 
                     Layout.fillWidth: true
-
-                    implicitHeight: 46
+                    implicitHeight: dtcCodeContent.implicitHeight + 24
 
                     radius: 10
-
                     color: root.surfaceRaisedColor
-
                     border.color: root.borderColor
                     border.width: 1
 
-                    Text {
-                        anchors.fill: parent
-                        anchors.leftMargin: 14
-                        anchors.rightMargin: 14
+                    ColumnLayout {
+                        id: dtcCodeContent
 
-                        text: modelData
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 12
 
-                        color: root.textPrimaryColor
+                        spacing: 5
 
-                        font.pixelSize: 16
-                        font.bold: true
+                        Text {
+                            Layout.fillWidth: true
 
-                        verticalAlignment:
-                            Text.AlignVCenter
+                            text: modelData
+                            color: root.textPrimaryColor
+
+                            font.pixelSize: 16
+                            font.bold: true
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+
+                            text: root.backendAvailable
+                                  ? root.backend.dtcDescription(modelData)
+                                  : ""
+
+                            color: root.textSecondaryColor
+
+                            font.pixelSize: 12
+                            wrapMode: Text.WordWrap
+                            lineHeight: 1.12
+                        }
                     }
                 }
             }
