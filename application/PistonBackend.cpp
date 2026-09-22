@@ -14,6 +14,7 @@
 #include <QStandardPaths>
 #include <initializer_list>
 #include <QSaveFile>
+#include <QHash>
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
@@ -33,6 +34,117 @@ const QBluetoothUuid PistonBackend::kRxCharacteristicUuid(
 
 namespace
 {
+
+// ------------------------------------------------------------
+//DTC descriptions
+// ------------------------------------------------------------
+
+const QHash<QString, QString> DTC_DESCRIPTIONS =
+    {
+        {"P0010", "Camshaft timing actuator circuit problem for Bank 1. The engine computer detected an electrical fault in the camshaft timing control circuit."},
+        {"P0011", "Bank 1 intake camshaft timing is more advanced than expected. This can be related to variable valve timing operation, oil flow, or camshaft timing control."},
+        {"P0012", "Bank 1 intake camshaft timing is more delayed than expected. This can be related to variable valve timing operation, oil flow, or camshaft timing control."},
+        {"P0013", "Camshaft timing actuator circuit problem for Bank 1 exhaust camshaft. The engine computer detected an electrical fault in the timing control circuit."},
+        {"P0014", "Bank 1 exhaust camshaft timing is more advanced than expected. This can be related to variable valve timing operation, oil flow, or camshaft timing control."},
+        {"P0016", "The crankshaft and Bank 1 intake camshaft positions are not matching as expected. This can indicate a timing, sensor, or variable valve timing problem."},
+        {"P0017", "The crankshaft and Bank 1 exhaust camshaft positions are not matching as expected. This can indicate a timing, sensor, or variable valve timing problem."},
+
+        {"P0100", "Mass airflow sensor circuit problem. The engine computer detected an electrical issue with the sensor used to measure incoming air."},
+        {"P0101", "Mass airflow sensor readings are outside the expected operating range. Airflow measurements may not agree with other engine operating conditions."},
+        {"P0102", "Mass airflow sensor signal is lower than expected."},
+        {"P0103", "Mass airflow sensor signal is higher than expected."},
+
+        {"P0105", "Manifold pressure sensor circuit problem. The engine computer detected an electrical issue with the intake manifold pressure signal."},
+        {"P0106", "Manifold pressure sensor readings are outside the expected operating range."},
+        {"P0107", "Manifold pressure sensor signal is lower than expected."},
+        {"P0108", "Manifold pressure sensor signal is higher than expected."},
+
+        {"P0112", "Intake air temperature sensor signal is lower than expected, usually indicating an unusually high reported air temperature or an electrical circuit issue."},
+        {"P0113", "Intake air temperature sensor signal is higher than expected, usually indicating an unusually low reported air temperature or an electrical circuit issue."},
+        {"P0117", "Engine coolant temperature sensor signal is lower than expected."},
+        {"P0118", "Engine coolant temperature sensor signal is higher than expected."},
+
+        {"P0121", "Throttle position sensor reading is outside the expected operating range."},
+        {"P0122", "Throttle position sensor signal is lower than expected."},
+        {"P0123", "Throttle position sensor signal is higher than expected."},
+
+        {"P0130", "Oxygen sensor circuit problem for Bank 1, Sensor 1. This is the sensor before the catalytic converter."},
+        {"P0131", "Bank 1, Sensor 1 oxygen sensor voltage is lower than expected."},
+        {"P0132", "Bank 1, Sensor 1 oxygen sensor voltage is higher than expected."},
+        {"P0133", "Bank 1, Sensor 1 oxygen sensor is responding more slowly than expected."},
+        {"P0134", "Little or no activity was detected from the Bank 1, Sensor 1 oxygen sensor."},
+        {"P0135", "Heater circuit problem for the Bank 1, Sensor 1 oxygen sensor."},
+
+        {"P0136", "Oxygen sensor circuit problem for Bank 1, Sensor 2. This is normally the sensor after the catalytic converter."},
+        {"P0137", "Bank 1, Sensor 2 oxygen sensor voltage is lower than expected."},
+        {"P0138", "Bank 1, Sensor 2 oxygen sensor voltage is higher than expected."},
+        {"P0139", "Bank 1, Sensor 2 oxygen sensor is responding more slowly than expected."},
+        {"P0140", "Little or no activity was detected from the Bank 1, Sensor 2 oxygen sensor."},
+        {"P0141", "Heater circuit problem for the Bank 1, Sensor 2 oxygen sensor. This is normally the sensor after the catalytic converter."},
+
+        {"P0150", "Oxygen sensor circuit problem for Bank 2, Sensor 1. This is the sensor before the catalytic converter."},
+        {"P0151", "Bank 2, Sensor 1 oxygen sensor voltage is lower than expected."},
+        {"P0152", "Bank 2, Sensor 1 oxygen sensor voltage is higher than expected."},
+        {"P0153", "Bank 2, Sensor 1 oxygen sensor is responding more slowly than expected."},
+        {"P0154", "Little or no activity was detected from the Bank 2, Sensor 1 oxygen sensor."},
+        {"P0155", "Heater circuit problem for the Bank 2, Sensor 1 oxygen sensor."},
+
+        {"P0156", "Oxygen sensor circuit problem for Bank 2, Sensor 2. This is normally the sensor after the catalytic converter."},
+        {"P0157", "Bank 2, Sensor 2 oxygen sensor voltage is lower than expected."},
+        {"P0158", "Bank 2, Sensor 2 oxygen sensor voltage is higher than expected."},
+        {"P0159", "Bank 2, Sensor 2 oxygen sensor is responding more slowly than expected."},
+        {"P0160", "Little or no activity was detected from the Bank 2, Sensor 2 oxygen sensor."},
+        {"P0161", "Heater circuit problem for the Bank 2, Sensor 2 oxygen sensor."},
+
+        {"P0171", "The engine is correcting for a lean air-fuel condition on Bank 1. The engine computer is adding more fuel than expected."},
+        {"P0172", "The engine is correcting for a rich air-fuel condition on Bank 1. The engine computer is removing more fuel than expected."},
+        {"P0174", "The engine is correcting for a lean air-fuel condition on Bank 2. The engine computer is adding more fuel than expected."},
+        {"P0175", "The engine is correcting for a rich air-fuel condition on Bank 2. The engine computer is removing more fuel than expected."},
+
+        {"P0300", "Random or multiple-cylinder misfires were detected. Combustion was inconsistent across one or more cylinders."},
+        {"P0301", "A misfire was detected on cylinder 1."},
+        {"P0302", "A misfire was detected on cylinder 2."},
+        {"P0303", "A misfire was detected on cylinder 3."},
+        {"P0304", "A misfire was detected on cylinder 4."},
+        {"P0305", "A misfire was detected on cylinder 5."},
+        {"P0306", "A misfire was detected on cylinder 6."},
+        {"P0307", "A misfire was detected on cylinder 7."},
+        {"P0308", "A misfire was detected on cylinder 8."},
+
+        {"P0325", "Knock sensor circuit problem for Bank 1. The engine computer detected an electrical or signal issue with the knock sensor system."},
+        {"P0335", "Crankshaft position sensor circuit problem. The engine computer is not receiving the expected crankshaft position signal."},
+        {"P0340", "Camshaft position sensor circuit problem for Bank 1. The engine computer is not receiving the expected camshaft position signal."},
+
+        {"P0401", "Exhaust gas recirculation flow is lower than expected."},
+        {"P0402", "Exhaust gas recirculation flow is higher than expected."},
+
+        {"P0420", "Catalytic converter efficiency is below the expected level on Bank 1. The exhaust sensor readings suggest the catalyst may not be reducing emissions as effectively as expected."},
+        {"P0430", "Catalytic converter efficiency is below the expected level on Bank 2. The exhaust sensor readings suggest the catalyst may not be reducing emissions as effectively as expected."},
+
+        {"P0440", "The evaporative emissions system detected a general fault. This system prevents fuel vapors from escaping into the atmosphere."},
+        {"P0442", "A small leak was detected in the evaporative emissions system. This can be caused by a loose seal, hose leak, valve issue, or another small vapor leak."},
+        {"P0446", "The evaporative emissions vent control system is not operating as expected."},
+        {"P0455", "A large leak was detected in the evaporative emissions system, or the system may not be sealing properly."},
+        {"P0456", "A very small leak was detected in the evaporative emissions system."},
+
+        {"P0500", "Vehicle speed sensor signal is missing or outside the expected range."},
+
+        {"P0560", "The vehicle's system voltage is not behaving as expected."},
+        {"P0562", "Vehicle system voltage is lower than expected. This may be related to the battery, charging system, wiring, or electrical load."},
+        {"P0563", "Vehicle system voltage is higher than expected. This may be related to charging-system regulation or an electrical circuit issue."},
+
+        {"P0606", "The engine or powertrain control module detected an internal processor fault."},
+        {"P0700", "The transmission control system has requested a warning because another transmission-related fault is stored."},
+
+        {"U0100", "Communication with the engine or powertrain control module was lost."},
+        {"U0101", "Communication with the transmission control module was lost."},
+        {"U0121", "Communication with the anti-lock brake or stability-control module was lost."},
+        {"U0140", "Communication with the body control module was lost."}
+};
+
+
+
+
 
 // ------------------------------------------------------------
 // VIN model-year decoding
@@ -1288,6 +1400,20 @@ QString PistonBackend::dtcError() const
     return m_dtcError;
 }
 
+QString PistonBackend::dtcDescription(const QString& code) const
+{
+    const QString normalizedCode = code.trimmed().toUpper();
+    const auto description = DTC_DESCRIPTIONS.constFind(normalizedCode);
+
+    if (description != DTC_DESCRIPTIONS.constEnd())
+    {
+        return description.value();
+    }
+
+    return QStringLiteral(
+        "A detailed description for this trouble code is not stored in the offline P.I.S.T.O.N. database. "
+        "Refer to the vehicle manufacturer's service information for the exact definition.");
+}
 
 void PistonBackend::connectToPiston()
 {
