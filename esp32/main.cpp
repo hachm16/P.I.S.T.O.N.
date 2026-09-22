@@ -305,7 +305,7 @@ struct CatalystResultsToTransmit
     const char* condition;
     const char* actionLevel;
     const char* evidenceSource;
-    char description[256];
+    char description[724];
 };
 
 
@@ -3744,19 +3744,24 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         float totalTrimMagnitude = fabs(fuelFeatures.values[6]);
 
 
-        // Keep an Eye Out requires either a meaningful model score
-        // or total fuel trim outside the healthy range
-       bool fuelKeepEvidence = fuelAlert || totalTrimMagnitude >= FUEL_KEEP_EYE_TRIM_THRESHOLD;
+        // Diagnostic logic evidence begins when total fuel trim
+        // reaches the monitoring threshold
+        bool fuelDiagnosticEvidence = totalTrimMagnitude >= FUEL_KEEP_EYE_TRIM_THRESHOLD;
 
-        // Inspect Soon requires clearly stronger fuel behavior
-        bool fuelInspectEvidence = totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD ||
+
+        // Keep an Eye Out requires agreement between
+        // the Isolation Forest and diagnostic logic
+        bool fuelKeepEvidence = fuelAlert && fuelDiagnosticEvidence;
+
+
+        // Inspect Soon also requires both evidence sources.
+        // Severity is reached by either a large fuel-trim
+        // deviation or a stronger Isolation Forest score.
+        bool fuelInspectEvidence = fuelAlert &&
             (
-                fuelScore >= FUEL_INSPECT_SCORE_THRESHOLD &&
-                totalTrimMagnitude >= FUEL_KEEP_EYE_TRIM_THRESHOLD
+                totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD ||
+                (fuelScore >= FUEL_INSPECT_SCORE_THRESHOLD && fuelDiagnosticEvidence)
             );
-
-            bool fuelDiagnosticEvidence =
-    totalTrimMagnitude >= FUEL_KEEP_EYE_TRIM_THRESHOLD;
 
 
     if (fuelAlert && fuelDiagnosticEvidence)
@@ -3839,95 +3844,79 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         Serial.print("Action Level: ");
         Serial.println(fuelResults.actionLevel);
 
-        float signedTotalTrim =
-            fuelFeatures.values[6];
+        float signedTotalTrim = fuelFeatures.values[6];
+        float diagnosticThreshold = totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD ? FUEL_INSPECT_TRIM_THRESHOLD : FUEL_KEEP_EYE_TRIM_THRESHOLD;
+        float trimAmountPastThreshold = totalTrimMagnitude - diagnosticThreshold;
 
-        float trimAmountPastThreshold = 0.0f;
-
-
-        // No abnormal evidence
-        if (!fuelKeepEvidence)
+        // 00 - Neither method detected abnormal behavior
+        if (!fuelAlert && !fuelDiagnosticEvidence)
         {
             snprintf(
                 fuelResults.description,
                 sizeof(fuelResults.description),
-                "Average total fuel trim was %+.1f%%, which remained within the expected +/-%.1f%% monitoring range.",
+                "Fuel delivery remained within the expected operating range. Average fuel correction was %+.1f%%, which remained within the +/-%.1f%% monitoring range.",
                 signedTotalTrim,
                 FUEL_KEEP_EYE_TRIM_THRESHOLD);
         }
 
-
-        // Isolation Forest only
+        // 10 - Isolation Forest only
         else if (fuelAlert && !fuelDiagnosticEvidence)
         {
             snprintf(
                 fuelResults.description,
                 sizeof(fuelResults.description),
-                "The system detected a fuel behavior pattern that differed from the normal patterns learned during training. Average total fuel trim was %+.1f%%, which remained within the expected +/-%.1f%% monitoring range.",
+                "The predictive model noticed a fuel-delivery pattern that differed somewhat from learned normal behavior. Average fuel correction was %+.1f%% and remained within the expected +/-%.1f%% range, so the result remains Normal Operation.",
                 signedTotalTrim,
                 FUEL_KEEP_EYE_TRIM_THRESHOLD);
         }
 
-
-        // Diagnostic logic triggered
-        else
+        // 01 - Diagnostic logic only
+        else if (!fuelAlert && fuelDiagnosticEvidence)
         {
-            float diagnosticThreshold =
-                fuelInspectEvidence &&
-                totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD
-                    ? FUEL_INSPECT_TRIM_THRESHOLD
-                    : FUEL_KEEP_EYE_TRIM_THRESHOLD;
-
-            trimAmountPastThreshold =
-                totalTrimMagnitude - diagnosticThreshold;
-
-
-            if (fuelAlert)
+            if (signedTotalTrim >= 0.0f)
             {
-                if (signedTotalTrim >= 0.0f)
-                {
-                    snprintf(
-                        fuelResults.description,
-                        sizeof(fuelResults.description),
-                        "The system detected a fuel behavior pattern that differed from the normal patterns learned during training. Average total fuel trim was %+.1f%%, which was %.1f percentage points above the +%.1f%% threshold.",
-                        signedTotalTrim,
-                        trimAmountPastThreshold,
-                        diagnosticThreshold);
-                }
-                else
-                {
-                    snprintf(
-                        fuelResults.description,
-                        sizeof(fuelResults.description),
-                        "The system detected a fuel behavior pattern that differed from the normal patterns learned during training. Average total fuel trim was %.1f%%, which was %.1f percentage points below the -%.1f%% threshold.",
-                        signedTotalTrim,
-                        trimAmountPastThreshold,
-                        diagnosticThreshold);
-                }
+                snprintf(
+                    fuelResults.description,
+                    sizeof(fuelResults.description),
+                    "The engine computer added an average of %.1f%% fuel, which was %.1f percentage points beyond the %.1f%% fuel-correction threshold for this case. The predictive model did not detect an abnormal overall fuel pattern, so the result remains Normal Operation.",
+                    signedTotalTrim,
+                    trimAmountPastThreshold,
+                    diagnosticThreshold);
             }
-
             else
             {
-                if (signedTotalTrim >= 0.0f)
-                {
-                    snprintf(
-                        fuelResults.description,
-                        sizeof(fuelResults.description),
-                        "Average total fuel trim was %+.1f%%, which was %.1f percentage points above the +%.1f%% threshold.",
-                        signedTotalTrim,
-                        trimAmountPastThreshold,
-                        diagnosticThreshold);
-                }
-                else
-                {
-                    snprintf(
-                        fuelResults.description,
-                        sizeof(fuelResults.description),
-                        "Average total fuel trim was %.1f%%, which was %.1f percentage points below the -%.1f%% threshold.",
-                        signedTotalTrim,
-                        trimAmountPastThreshold,
-                        diagnosticThreshold);
-                }
+                snprintf(
+                    fuelResults.description,
+                    sizeof(fuelResults.description),
+                    "The engine computer removed an average of %.1f%% fuel, which was %.1f percentage points beyond the %.1f%% fuel-correction threshold for this case. The predictive model did not detect an abnormal overall fuel pattern, so the result remains Normal Operation.",
+                    fabs(signedTotalTrim),
+                    trimAmountPastThreshold,
+                    diagnosticThreshold);
+            }
+        }
+
+        // 11 - Both methods agree
+        else
+        {
+            if (signedTotalTrim >= 0.0f)
+            {
+                snprintf(
+                    fuelResults.description,
+                    sizeof(fuelResults.description),
+                    "Both the predictive model and measured fuel correction detected lean fuel behavior. The engine computer added an average of %.1f%% fuel, exceeding the %.1f%% threshold by %.1f percentage points.",
+                    signedTotalTrim,
+                    diagnosticThreshold,
+                    trimAmountPastThreshold);
+            }
+            else
+            {
+                snprintf(
+                    fuelResults.description,
+                    sizeof(fuelResults.description),
+                    "Both the predictive model and measured fuel correction detected rich fuel behavior. The engine computer removed an average of %.1f%% fuel, exceeding the %.1f%% threshold by %.1f percentage points.",
+                    fabs(signedTotalTrim),
+                    diagnosticThreshold,
+                    trimAmountPastThreshold);
             }
         }
 
@@ -4143,16 +4132,41 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
         catalystResults.strongPersistentMirroring = catalystStrongPersistentMirroring;
 
-        bool catalystHybridAlert = catalystIfAlert || catalystPersistentMirroring;
+        // Diagnostic evidence requires persistent oxygen-sensor
+        // behavior rather than a single-case correlation
+        bool catalystDiagnosticEvidence =
+            catalystPersistentMirroring ||
+            catalystStrongPersistentMirroring;
 
-        catalystResults.hybridAlert = catalystHybridAlert;
 
-        bool catalystKeepEvidence = catalystHybridAlert;
+        // Customer-facing catalyst alerts require agreement
+        // between the Isolation Forest and diagnostic logic
+        bool catalystHybridAlert =
+            catalystIfAlert &&
+            catalystDiagnosticEvidence;
 
-        bool catalystInspectEvidence = (catalystScore >= CATALYST_INSPECT_SCORE_THRESHOLD && catalystPersistentMirroring) || catalystStrongPersistentMirroring;
+        catalystResults.hybridAlert =
+            catalystHybridAlert;
 
-        bool catalystDiagnosticEvidence = catalystPersistentMirroring || catalystStrongPersistentMirroring;
 
+        bool catalystKeepEvidence =
+            catalystHybridAlert;
+
+
+        // Inspect Soon also requires both evidence sources.
+        // Strong persistent mirroring can provide the diagnostic
+        // severity without requiring the higher IF score.
+        bool catalystInspectEvidence =
+            catalystIfAlert &&
+            (
+                (
+                    catalystScore >=
+                        CATALYST_INSPECT_SCORE_THRESHOLD &&
+                    catalystPersistentMirroring
+                )
+                ||
+                catalystStrongPersistentMirroring
+            );
 
         if (catalystIfAlert && catalystDiagnosticEvidence)
         {
@@ -4265,12 +4279,14 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
         Serial.print("Condition: ");
 
-        if (catalystPersistentMirroring) catalystResults.condition = "Reduced-efficiency catalyst behavior";
-        
-
-        else if (catalystIfAlert) catalystResults.condition = "Abnormal catalyst behavior";
-        
-        else catalystResults.condition = "Normal";
+        if (catalystKeepEvidence)
+        {
+            catalystResults.condition = "Reduced-efficiency catalyst behavior";
+        }
+        else
+        {
+            catalystResults.condition ="Normal";
+        }
         
 
         Serial.println(catalystResults.condition);
@@ -4293,79 +4309,68 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
         Serial.println(catalystResults.actionLevel);
 
-        // No abnormal evidence
-        if (!catalystKeepEvidence)
+        // 00 - Neither method detected abnormal behavior
+        if (!catalystIfAlert && !catalystDiagnosticEvidence)
         {
             snprintf(
                 catalystResults.description,
                 sizeof(catalystResults.description),
-                "Bank %u oxygen sensor behavior did not show persistent upstream and downstream mirroring.",
+                "Bank %u catalyst behavior remained consistent with normal operation. The oxygen sensor after the catalytic converter stayed sufficiently different from the sensor before it, which is expected when the catalyst is working normally.",
                 catalystFeatures.selectedBank);
         }
 
-
-        // Isolation Forest only
+        // 10 - Isolation Forest only
         else if (catalystIfAlert && !catalystDiagnosticEvidence)
         {
             snprintf(
                 catalystResults.description,
                 sizeof(catalystResults.description),
-                "The system detected a catalyst behavior pattern that differed from the normal patterns learned during training. Persistent upstream and downstream oxygen sensor mirroring was not detected.");
+                "The predictive model noticed an exhaust-sensor pattern that differed somewhat from learned normal behavior. However, the sensor after the catalyst did not repeatedly follow the sensor before it, so the result remains Normal Operation.");
         }
 
-
-        // Strong persistent diagnostic evidence
-        else if (catalystStrongPersistentMirroring)
+        // 01 - Diagnostic logic only
+        else if (!catalystIfAlert && catalystDiagnosticEvidence)
         {
-            if (catalystIfAlert)
+            if (catalystStrongPersistentMirroring)
             {
                 snprintf(
                     catalystResults.description,
                     sizeof(catalystResults.description),
-                    "The system detected a catalyst behavior pattern that differed from the normal patterns learned during training. Bank %u oxygen sensor behavior showed strong mirroring for %u consecutive cases, with a maximum correlation of %.2f compared with the %.2f strong-mirroring threshold.",
+                    "The oxygen sensor after the Bank %u catalyst closely followed the sensor before it for %u consecutive cases. This can be associated with reduced catalyst efficiency, but the predictive model did not detect an abnormal overall pattern, so the result remains Normal Operation.",
                     catalystFeatures.selectedBank,
-                    currentStrongMirroringCount,
-                    catalystFeatures.maximumLaggedCorrelation,
-                    CATALYST_STRONG_CORRELATION_THRESHOLD);
+                    currentStrongMirroringCount);
             }
             else
             {
                 snprintf(
                     catalystResults.description,
                     sizeof(catalystResults.description),
-                    "Bank %u oxygen sensor behavior showed strong mirroring for %u consecutive cases, with a maximum correlation of %.2f compared with the %.2f strong-mirroring threshold.",
+                    "The oxygen sensor after the Bank %u catalyst followed the sensor before it more closely than expected for %u consecutive cases. The predictive model did not detect an abnormal overall pattern, so the result remains Normal Operation.",
                     catalystFeatures.selectedBank,
-                    currentStrongMirroringCount,
-                    catalystFeatures.maximumLaggedCorrelation,
-                    CATALYST_STRONG_CORRELATION_THRESHOLD);
+                    currentMirroringCount);
             }
         }
 
-
-        // Regular persistent diagnostic evidence
+        // 11 - Both methods agree
         else
         {
-            if (catalystIfAlert)
+            if (catalystStrongPersistentMirroring)
             {
                 snprintf(
                     catalystResults.description,
                     sizeof(catalystResults.description),
-                    "The system detected a catalyst behavior pattern that differed from the normal patterns learned during training. Bank %u upstream and downstream oxygen sensor behavior remained similar for %u consecutive cases, with a maximum correlation of %.2f compared with the %.2f mirroring threshold.",
+                    "Both the predictive model and repeated oxygen-sensor behavior indicate that the sensor after the Bank %u catalyst is closely following the sensor before it. This continued for %u consecutive cases and provides stronger evidence of reduced catalyst efficiency.",
                     catalystFeatures.selectedBank,
-                    currentMirroringCount,
-                    catalystFeatures.maximumLaggedCorrelation,
-                    CATALYST_CORRELATION_THRESHOLD);
+                    currentStrongMirroringCount);
             }
             else
             {
                 snprintf(
                     catalystResults.description,
                     sizeof(catalystResults.description),
-                    "Bank %u upstream and downstream oxygen sensor behavior remained similar for %u consecutive cases, with a maximum correlation of %.2f compared with the %.2f mirroring threshold.",
+                    "Both the predictive model and repeated oxygen-sensor behavior indicate that the sensor after the Bank %u catalyst is following the sensor before it more closely than expected. This continued for %u consecutive cases and can indicate reduced catalyst efficiency.",
                     catalystFeatures.selectedBank,
-                    currentMirroringCount,
-                    catalystFeatures.maximumLaggedCorrelation,
-                    CATALYST_CORRELATION_THRESHOLD);
+                    currentMirroringCount);
             }
         }
 
@@ -4495,13 +4500,10 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         }
 
 
-        bool chargingPhysicalMild =
-            chargingMildEvidenceCount > 0;
+        bool chargingPhysicalMild = chargingMildEvidenceCount > 0;
 
 
-        bool chargingKeepEvidence =
-            chargingAlert ||
-            chargingPhysicalMild;
+        bool chargingKeepEvidence = chargingAlert && chargingPhysicalMild;
 
 
         // Strong physical evidence
@@ -4527,37 +4529,37 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         bool chargingStepStrong =
             maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP;
 
-        bool chargingStepStdStrong =
-            voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
+        bool chargingStepStdStrong = voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
 
-        bool chargingStrongThisCase = chargingStrongPhysical;
+        // A strong charging case requires agreement between
+        // the Isolation Forest and strong measured voltage behavior
+        bool chargingStrongThisCase = chargingAlert && chargingStrongPhysical;
 
         chargingResults.strongChargingCase = chargingStrongThisCase;
 
 
-        // Charging transients can happen during startup or load changes,
-        // so require strong behavior in two eligible cases
+        // Modern charging systems can intentionally change voltage
+        // with battery state and electrical load, so Inspect Soon
+        // requires strong agreement in consecutive cases
         if (chargingStrongThisCase)
         {
-            if (
-                chargingStrongConsecutiveCases <
-                CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES
-            )
+            if (chargingStrongConsecutiveCases < CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES)
             {
                 chargingStrongConsecutiveCases++;
             }
         }
-        else
-        {
-            chargingStrongConsecutiveCases = 0;
-        }
+        else chargingStrongConsecutiveCases = 0;
 
 
-        bool chargingInspectEvidence = chargingStrongConsecutiveCases >= CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES;
+        bool chargingInspectEvidence =
+            chargingStrongConsecutiveCases >= CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES;
 
         chargingResults.consecutiveStrongCases = chargingStrongConsecutiveCases;
 
-        bool chargingDiagnosticEvidence = chargingPhysicalMild;
+
+        // Evidence reporting should still record diagnostic evidence
+        // even when it is not enough to raise the action level
+        bool chargingDiagnosticEvidence = chargingPhysicalMild || chargingStrongPhysical;
 
         if (chargingAlert && chargingDiagnosticEvidence)
         {
@@ -4657,42 +4659,43 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
         chargingResults.description[0] = '\0';
 
-
-        // Nothing abnormal was detected
-        if (!chargingKeepEvidence)
+        // 00 - Neither method detected abnormal behavior
+        if (!chargingAlert && !chargingDiagnosticEvidence)
         {
             snprintf(
                 chargingResults.description,
                 sizeof(chargingResults.description),
-                "Charging behavior remained within the expected monitoring thresholds.");
+                "Charging-system voltage remained stable and within the expected operating limits during this case.");
         }
 
-
-        // Isolation Forest only
+        // 10 - Isolation Forest only
         else if (chargingAlert && !chargingDiagnosticEvidence)
         {
             snprintf(
                 chargingResults.description,
                 sizeof(chargingResults.description),
-                "The system detected a charging behavior pattern that differed from the normal patterns learned during training. The measured voltage behavior did not exceed any configured charging threshold.");
+                "The predictive model noticed a charging-voltage pattern that differed somewhat from learned normal behavior. Measured voltage levels and changes did not cross the configured monitoring limits, so the result remains Normal Operation.");
         }
 
-
-        // Diagnostic logic, or both IF and diagnostic logic
+        // Diagnostic evidence exists: 01 or 11
         else
         {
-            // Add the plain-language Isolation Forest explanation first when needed
-            if (chargingAlert)
+            if (!chargingAlert)
             {
                 snprintf(
                     chargingResults.description,
                     sizeof(chargingResults.description),
-                    "The system detected a charging behavior pattern that differed from the normal patterns learned during training.");
+                    "One or more charging measurements crossed a monitoring threshold during this case. The predictive model did not detect an abnormal overall charging pattern, so the result remains Normal Operation.");
+            }
+            else
+            {
+                snprintf(
+                    chargingResults.description,
+                    sizeof(chargingResults.description),
+                    "Both the predictive model and measured charging behavior detected an unusual voltage pattern.");
             }
 
-
             uint8_t evidenceItemsAdded = 0;
-
 
             // Strong evidence is added first
             // --------------------------------------------------------
