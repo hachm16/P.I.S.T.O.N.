@@ -136,7 +136,7 @@ public:
     Q_INVOKABLE void pauseLogging();
 
     Q_INVOKABLE void readDtcs();
-
+    Q_INVOKABLE QString dtcDescription(const QString& code) const;
 
 signals:
     void connectedChanged();
