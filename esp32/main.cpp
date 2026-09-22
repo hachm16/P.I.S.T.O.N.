@@ -184,7 +184,7 @@ struct VehicleSample
 // Feature structures
 // ------------------------------------------------------------
 
-// Statistics calculated from one parameter
+// Statistics calculated from one parameter collected
 struct ValueStatistics
 {
     bool available;
@@ -198,7 +198,7 @@ struct ValueStatistics
 };
 
 
-// Stores the 9 fuel model inputs
+// Stores the 9 fuel model input floats
 struct FuelCaseFeatures
 {
     bool ready;
@@ -650,41 +650,31 @@ float decodeControlModuleVoltage(
 // ------------------------------------------------------------
 
 // Converts the two raw SAE DTC bytes into a code such as P0141.
-void decodeDtcCode(
-    uint8_t byteA,
-    uint8_t byteB,
-    char output[6])
+void decodeDtcCode(uint8_t byteA, uint8_t byteB, char output[6])
 {
     static const char systemCharacters[4] =
     {
-        'P',
-        'C',
-        'B',
-        'U'
+        'P', // powertrain module
+        'C', // chassis module
+        'B', // body module
+        'U' // network module (CAN, wiring, etc...)
     };
 
-    static const char hexCharacters[] =
-        "0123456789ABCDEF";
+    // Used to convert the remaining binary values
+    // into their hexadecimal DTC characters
+    static const char hexCharacters[] = "0123456789ABCDEF";
 
-    output[0] =
-        systemCharacters[
-            (byteA >> 6) & 0x03];
+    // Bits 7-6 select the system category:
+    // 00 = P, 01 = C, 10 = B, 11 = U
+    output[0] = systemCharacters[(byteA >> 6) & 0x03];
+    //continue shifting
+    output[1] = static_cast<char>('0' + ((byteA >> 4) & 0x03));
 
-    output[1] =
-        static_cast<char>(
-            '0' + ((byteA >> 4) & 0x03));
+    output[2] = hexCharacters[byteA & 0x0F];
 
-    output[2] =
-        hexCharacters[
-            byteA & 0x0F];
+    output[3] = hexCharacters[(byteB >> 4) & 0x0F];
 
-    output[3] =
-        hexCharacters[
-            (byteB >> 4) & 0x0F];
-
-    output[4] =
-        hexCharacters[
-            byteB & 0x0F];
+    output[4] = hexCharacters[byteB & 0x0F];
 
     output[5] = '\0';
 }
@@ -697,18 +687,14 @@ bool sendIsoTpFlowControl(
 {
     // For the standard 11-bit OBD-II addressing used here,
     // 0x7E8 responds to 0x7E0, 0x7E9 to 0x7E1, etc.
-    if (ecuResponseId <
-            OBD_RESPONSE_MIN_ID ||
-        ecuResponseId >
-            OBD_RESPONSE_MAX_ID)
+    if (ecuResponseId < OBD_RESPONSE_MIN_ID || ecuResponseId > OBD_RESPONSE_MAX_ID)
     {
         return false;
     }
 
     twai_message_t flowControl = {};
 
-    flowControl.identifier =
-        ecuResponseId - 0x08;
+    flowControl.identifier = ecuResponseId - 0x08;
 
     flowControl.extd = 0;
     flowControl.rtr = 0;
@@ -729,10 +715,7 @@ bool sendIsoTpFlowControl(
     flowControl.data[6] = 0x00;
     flowControl.data[7] = 0x00;
 
-    return twai_transmit(
-               &flowControl,
-               pdMS_TO_TICKS(20)) ==
-           ESP_OK;
+    return twai_transmit(&flowControl, pdMS_TO_TICKS(20)) == ESP_OK;
 }
 
 
@@ -740,11 +723,7 @@ bool sendIsoTpFlowControl(
 // the positive response service byte.
 //
 // Supports both ISO-TP single-frame and multi-frame replies.
-bool requestObdServicePayload(
-    uint8_t service,
-    uint8_t* outputData,
-    size_t outputCapacity,
-    size_t& outputLength)
+bool requestObdServicePayload(uint8_t service, uint8_t* outputData, size_t outputCapacity, size_t& outputLength)
 {
     outputLength = 0;
 
@@ -757,8 +736,7 @@ bool requestObdServicePayload(
 
     twai_message_t request = {};
 
-    request.identifier =
-        OBD_FUNCTIONAL_REQUEST_ID;
+    request.identifier = OBD_FUNCTIONAL_REQUEST_ID;
 
     request.extd = 0;
     request.rtr = 0;
@@ -776,22 +754,22 @@ bool requestObdServicePayload(
     request.data[6] = 0x00;
     request.data[7] = 0x00;
 
-
-    if (twai_transmit(
-            &request,
-            pdMS_TO_TICKS(20)) != ESP_OK)
-    {
-        return false;
-    }
+    // Send the OBD-II request onto the CAN bus.
+    // If transmission fails, stop the request immediately.
+    if (twai_transmit(&request, pdMS_TO_TICKS(20)) != ESP_OK) return false;
+    
 
 
-    const uint8_t expectedResponseService =
-        service + 0x40;
+    const uint8_t expectedResponseService = service + 0x40;
+    // A positive OBD-II response uses the requested service
+    // number plus 0x40.
+    // Example: Mode 03 request -> 0x43 response.
 
+    // Record when the request started so the response loop
+    // can stop after the configured timeout.
+    uint32_t requestStartTime = millis();
 
-    uint32_t requestStartTime =
-        millis();
-
+    // Tracks if ISO-TP response being reconstructed
     bool multiFrameActive = false;
 
     uint32_t multiFrameResponseId = 0;
@@ -805,31 +783,28 @@ bool requestObdServicePayload(
     // Receive response
     // --------------------------------------------------------
 
-    while (
-        millis() - requestStartTime <
-        DTC_RESPONSE_TIMEOUT_MS)
+    // Wait for the ECU response until the DTC response timeout is reached.
+    while (millis() - requestStartTime < DTC_RESPONSE_TIMEOUT_MS)
     {
         twai_message_t response = {};
 
-        if (twai_receive(
-                &response,
-                pdMS_TO_TICKS(10)) != ESP_OK)
+        // Try to receive the next CAN frame.
+        // If no frame is available yet, keep waiting.
+        if (twai_receive(&response, pdMS_TO_TICKS(10)) != ESP_OK)
         {
             continue;
         }
 
-
-        if (response.extd ||
-            response.rtr)
+    // Ignore extended-ID frames and remote request frames.
+    // Standard OBD-II responses use normal 11-bit data frames.
+        if (response.extd ||response.rtr)
         {
             continue;
         }
 
-
-        if (response.identifier <
-                OBD_RESPONSE_MIN_ID ||
-            response.identifier >
-                OBD_RESPONSE_MAX_ID)
+    // Only accept responses from the standard OBD-II ECU
+    // response ID range of 0x7E8 through 0x7EF.
+        if (response.identifier < OBD_RESPONSE_MIN_ID || response.identifier > OBD_RESPONSE_MAX_ID)
         {
             continue;
         }
@@ -837,91 +812,84 @@ bool requestObdServicePayload(
 
         // If live-data collection already selected an ECU,
         // stay with that ECU.
-        if (selectedEcuResponseId != 0 &&
-            response.identifier !=
-                selectedEcuResponseId)
+        if (selectedEcuResponseId != 0 && response.identifier != selectedEcuResponseId)
         {
             continue;
         }
 
-
+    // At least two bytes are needed to identify
+    // the ISO-TP frame type and response contents.
         if (response.data_length_code < 2)
         {
             continue;
         }
 
-
-        const uint8_t frameType =
-            response.data[0] >> 4;
+        // The upper four bits identify the ISO-TP frame type:
+        // 0x0 = Single Frame, 0x1 = First Frame, 0x2 = Consecutive Frame.
+        const uint8_t frameType = response.data[0] >> 4;
 
 
         // ----------------------------------------------------
         // ISO-TP single frame
         // ----------------------------------------------------
 
-        if (!multiFrameActive &&
-            frameType == 0x00)
+        if (!multiFrameActive && frameType == 0x00)
         {
-            const uint8_t payloadLength =
-                response.data[0] & 0x0F;
+            // Handle a complete ISO-TP Single Frame response.
+            // This is used when the full DTC response fits in one CAN frame.
+            const uint8_t payloadLength = response.data[0] & 0x0F;
 
+    // The lower four bits of the first byte contain the number of payload bytes that follow.
             if (payloadLength < 1)
             {
                 continue;
             }
 
 
-            if (response.data_length_code <
-                1 + payloadLength)
+            if (response.data_length_code < 1 + payloadLength)
             {
                 continue;
             }
 
 
-            if (response.data[1] !=
-                expectedResponseService)
+            if (response.data[1] != expectedResponseService)
             {
                 continue;
             }
 
 
-            const size_t dataLength =
-                payloadLength - 1;
+            const size_t dataLength = payloadLength - 1;
 
 
-            if (dataLength >
-                outputCapacity)
+            if (dataLength > outputCapacity)
             {
                 return false;
             }
 
-
+            // If an ECU has not already been selected,
+            // use the ECU that returned this valid response.
             if (selectedEcuResponseId == 0)
             {
-                selectedEcuResponseId =
-                    response.identifier;
+                selectedEcuResponseId = response.identifier;
 
-                Serial.printf(
-                    "Selected ECU response ID: "
-                    "0x%03lX\n",
-                    static_cast<unsigned long>(
-                        selectedEcuResponseId));
+                Serial.printf("Selected ECU response ID: "
+                    "0x%03lX\n", static_cast<unsigned long>(selectedEcuResponseId));
             }
 
 
-            for (size_t i = 0;
-                 i < dataLength;
-                 i++)
+            // Copy the DTC response data into the caller's buffer.
+            // response.data[0] is ISO-TP information and
+            // response.data[1] is the OBD-II response service.
+            for (size_t i = 0; i < dataLength; i++)
             {
-                outputData[i] =
-                    response.data[2 + i];
+                outputData[i] = response.data[2 + i];
             }
 
+            // Store how many useful payload bytes were returned.
+            outputLength = dataLength;
 
-            outputLength =
-                dataLength;
+            return true; // A complete valid Single Frame response was received.
 
-            return true;
         }
 
 
@@ -929,8 +897,7 @@ bool requestObdServicePayload(
         // ISO-TP first frame
         // ----------------------------------------------------
 
-        if (!multiFrameActive &&
-            frameType == 0x01)
+        if (!multiFrameActive && frameType == 0x01)
         {
             if (response.data_length_code < 3)
             {
@@ -939,10 +906,7 @@ bool requestObdServicePayload(
 
 
             const size_t totalIsoTpLength =
-                (static_cast<size_t>(
-                     response.data[0] & 0x0F)
-                 << 8) |
-                response.data[1];
+                (static_cast<size_t>(response.data[0] & 0x0F) << 8) | response.data[1];
 
 
             // Total ISO-TP payload includes
@@ -953,78 +917,68 @@ bool requestObdServicePayload(
             }
 
 
-            if (response.data[2] !=
-                expectedResponseService)
+            if (response.data[2] != expectedResponseService)
             {
                 continue;
             }
 
 
-            expectedPayloadLength =
-                totalIsoTpLength - 1;
+            expectedPayloadLength = totalIsoTpLength - 1;
 
-
-            if (expectedPayloadLength >
-                outputCapacity)
+        // Stop if the caller's output buffer is not large
+        // enough for the complete multi-frame payload.
+            if (expectedPayloadLength > outputCapacity)
             {
                 return false;
             }
 
-
+        // If an ECU has not already been selected,
+        // use the ECU that returned this valid response.
             if (selectedEcuResponseId == 0)
             {
-                selectedEcuResponseId =
-                    response.identifier;
+                selectedEcuResponseId = response.identifier;
 
                 Serial.printf(
                     "Selected ECU response ID: "
                     "0x%03lX\n",
-                    static_cast<unsigned long>(
-                        selectedEcuResponseId));
+                    static_cast<unsigned long>(selectedEcuResponseId));
             }
 
 
-            multiFrameResponseId =
-                response.identifier;
+            multiFrameResponseId = response.identifier;
 
 
             // First-frame application data begins
             // after PCI bytes and response service.
-            const size_t availableBytes =
-                response.data_length_code > 3
-                    ? response.data_length_code - 3
-                    : 0;
+            size_t availableBytes = 0;
 
+            if (response.data_length_code > 3) availableBytes = response.data_length_code - 3;
+        
+        
+        // Start by assuming the remaining payload will fit.
+        // If fewer bytes are available in this first frame,
+        // only copy the bytes that are actually present.
+            size_t bytesToCopy = expectedPayloadLength;
 
-            const size_t bytesToCopy =
-                availableBytes <
-                        expectedPayloadLength
-                    ? availableBytes
-                    : expectedPayloadLength;
+            if (availableBytes < expectedPayloadLength) bytesToCopy = availableBytes;
+            
 
-
-            for (size_t i = 0;
-                 i < bytesToCopy;
-                 i++)
+            for (size_t i = 0; i < bytesToCopy; i++)
             {
-                outputData[i] =
-                    response.data[3 + i];
+                outputData[i] = response.data[3 + i];
             }
 
 
-            outputLength =
-                bytesToCopy;
+            outputLength = bytesToCopy;
 
 
-            if (outputLength >=
-                expectedPayloadLength)
+            if (outputLength >= expectedPayloadLength)
             {
                 return true;
             }
 
 
-            if (!sendIsoTpFlowControl(
-                    multiFrameResponseId))
+            if (!sendIsoTpFlowControl(multiFrameResponseId))
             {
                 return false;
             }
@@ -1042,64 +996,46 @@ bool requestObdServicePayload(
         // ISO-TP consecutive frame
         // ----------------------------------------------------
 
-        if (multiFrameActive &&
-            response.identifier ==
-                multiFrameResponseId &&
-            frameType == 0x02)
+        if (multiFrameActive && response.identifier == multiFrameResponseId && frameType == 0x02)
         {
-            const uint8_t sequenceNumber =
-                response.data[0] & 0x0F;
+            const uint8_t sequenceNumber = response.data[0] & 0x0F;
 
 
-            if (sequenceNumber !=
-                expectedSequenceNumber)
+            if (sequenceNumber != expectedSequenceNumber)
             {
-                Serial.println(
-                    "ISO-TP sequence mismatch.");
+                Serial.println("ISO-TP sequence mismatch.");
 
                 return false;
             }
 
 
-            expectedSequenceNumber =
-                (expectedSequenceNumber + 1) &
-                0x0F;
+            expectedSequenceNumber = (expectedSequenceNumber + 1) & 0x0F;
 
 
-            const size_t remainingBytes =
-                expectedPayloadLength -
-                outputLength;
+            const size_t remainingBytes = expectedPayloadLength - outputLength;
 
 
-            const size_t availableBytes =
-                response.data_length_code > 1
-                    ? response.data_length_code - 1
-                    : 0;
+            size_t availableBytes = 0;
+
+            if (response.data_length_code > 1) availableBytes = response.data_length_code - 1;
+            
 
 
-            const size_t bytesToCopy =
-                availableBytes <
-                        remainingBytes
-                    ? availableBytes
-                    : remainingBytes;
+            size_t bytesToCopy = remainingBytes;
 
+            if (availableBytes < remainingBytes) bytesToCopy = availableBytes;
+            
 
-            for (size_t i = 0;
-                 i < bytesToCopy;
-                 i++)
+            for (size_t i = 0; i < bytesToCopy; i++)
             {
-                outputData[
-                    outputLength + i] =
-                    response.data[1 + i];
+                outputData[outputLength + i] = response.data[1 + i];
             }
 
 
-            outputLength +=
-                bytesToCopy;
+            outputLength += bytesToCopy;
 
 
-            if (outputLength >=
-                expectedPayloadLength)
+            if (outputLength >= expectedPayloadLength)
             {
                 return true;
             }
@@ -1112,25 +1048,18 @@ bool requestObdServicePayload(
 
 
 // Reads and decodes one DTC mode.
-void readDtcMode(
-    uint8_t service,
-    DtcList& result)
+void readDtcMode(uint8_t service, DtcList& result)
 {
     result.responseReceived = false;
     result.count = 0;
 
 
-    uint8_t responseData[
-        MAX_DTC_RESPONSE_BYTES] = {};
+    uint8_t responseData[MAX_DTC_RESPONSE_BYTES] = {};
 
     size_t responseLength = 0;
 
 
-    if (!requestObdServicePayload(
-            service,
-            responseData,
-            MAX_DTC_RESPONSE_BYTES,
-            responseLength))
+    if (!requestObdServicePayload(service, responseData, MAX_DTC_RESPONSE_BYTES, responseLength))
     {
         return;
     }
@@ -1140,31 +1069,21 @@ void readDtcMode(
 
 
     // DTCs are returned as two-byte values.
-    for (size_t i = 0;
-         i + 1 < responseLength &&
-         result.count <
-             MAX_DTC_CODES_PER_MODE;
-         i += 2)
+    for (size_t i = 0; i + 1 < responseLength && result.count < MAX_DTC_CODES_PER_MODE; i += 2)
     {
-        const uint8_t byteA =
-            responseData[i];
+        const uint8_t byteA = responseData[i];
 
-        const uint8_t byteB =
-            responseData[i + 1];
+        const uint8_t byteB = responseData[i + 1];
 
 
         // 0x0000 is padding / no DTC.
-        if (byteA == 0x00 &&
-            byteB == 0x00)
+        if (byteA == 0x00 && byteB == 0x00)
         {
             continue;
         }
 
 
-        decodeDtcCode(
-            byteA,
-            byteB,
-            result.codes[result.count]);
+        decodeDtcCode(byteA, byteB, result.codes[result.count]);
 
         result.count++;
     }
@@ -1172,25 +1091,16 @@ void readDtcMode(
 
 
 // Adds one DTC list to the outgoing JSON.
-void addDtcListToJson(
-    JsonDocument& doc,
-    const char* arrayName,
-    const char* responseName,
-    const DtcList& dtcs)
+void addDtcListToJson(JsonDocument& doc, const char* arrayName, const char* responseName, const DtcList& dtcs)
 {
-    doc[responseName] =
-        dtcs.responseReceived;
+    doc[responseName] = dtcs.responseReceived;
 
-    JsonArray array =
-        doc[arrayName].to<JsonArray>();
+    JsonArray array = doc[arrayName].to<JsonArray>();
 
 
-    for (size_t i = 0;
-         i < dtcs.count;
-         i++)
+    for (size_t i = 0; i < dtcs.count; i++)
     {
-        array.add(
-            dtcs.codes[i]);
+        array.add(dtcs.codes[i]);
     }
 }
 
@@ -1200,8 +1110,7 @@ void addDtcListToJson(
 void performDtcScanAndSend()
 {
     Serial.println();
-    Serial.println(
-        "=== DTC SCAN STARTED ===");
+    Serial.println("=== DTC SCAN STARTED ===");
 
 
     DtcList confirmed = {};
@@ -1209,69 +1118,42 @@ void performDtcScanAndSend()
     DtcList permanent = {};
 
 
-    Serial.println(
-        "Reading confirmed DTCs (Mode 03)...");
+    Serial.println("Reading confirmed DTCs (Mode 03)...");
 
-    readDtcMode(
-        0x03,
-        confirmed);
+    readDtcMode(0x03, confirmed);
 
 
-    Serial.println(
-        "Reading pending DTCs (Mode 07)...");
+    Serial.println("Reading pending DTCs (Mode 07)...");
 
-    readDtcMode(
-        0x07,
-        pending);
+    readDtcMode(0x07, pending);
 
 
-    Serial.println(
-        "Reading permanent DTCs (Mode 0A)...");
+    Serial.println("Reading permanent DTCs (Mode 0A)...");
 
-    readDtcMode(
-        0x0A,
-        permanent);
+    readDtcMode(0x0A, permanent);
 
 
     JsonDocument doc;
 
-    doc["type"] =
-        "dtc_result";
+    doc["type"] = "dtc_result";
 
 
-    const bool anyResponse =
-        confirmed.responseReceived ||
-        pending.responseReceived ||
-        permanent.responseReceived;
+    const bool anyResponse = confirmed.responseReceived || pending.responseReceived || permanent.responseReceived;
 
 
-    doc["success"] =
-        anyResponse;
+    doc["success"] = anyResponse;
 
 
-    addDtcListToJson(
-        doc,
-        "confirmed",
-        "confirmed_response",
-        confirmed);
+    addDtcListToJson(doc, "confirmed", "confirmed_response", confirmed);
 
-    addDtcListToJson(
-        doc,
-        "pending",
-        "pending_response",
-        pending);
+    addDtcListToJson(doc, "pending", "pending_response", pending);
 
-    addDtcListToJson(
-        doc,
-        "permanent",
-        "permanent_response",
-        permanent);
+    addDtcListToJson(doc, "permanent", "permanent_response", permanent);
 
 
     if (!anyResponse)
     {
-        doc["error"] =
-            "No OBD-II DTC response received";
+        doc["error"] = "No OBD-II DTC response received";
     }
 
 
@@ -1290,8 +1172,7 @@ void performDtcScanAndSend()
 
 
     Serial.println();
-    Serial.println(
-        "=== DTC SCAN COMPLETE ===");
+    Serial.println("=== DTC SCAN COMPLETE ===");
 } 
 
 // VIN / vehicle information
@@ -1299,24 +1180,17 @@ void performDtcScanAndSend()
 
 bool isValidVinCharacter(char value)
 {
-    const bool isNumber =
-        value >= '0' &&
-        value <= '9';
+    const bool isNumber = value >= '0' && value <= '9';
 
-    const bool isLetter =
-        value >= 'A' &&
-        value <= 'Z';
+    const bool isLetter = value >= 'A' && value <= 'Z';
 
-    if (!isNumber &&
-        !isLetter)
+    if (!isNumber && !isLetter)
     {
         return false;
     }
 
     // These letters are not used in standard VINs.
-    if (value == 'I' ||
-        value == 'O' ||
-        value == 'Q')
+    if (value == 'I' || value == 'O' || value == 'Q')
     {
         return false;
     }
@@ -1327,16 +1201,14 @@ bool isValidVinCharacter(char value)
 
 // Requests OBD-II Mode 09 PID 02 and reconstructs
 // the 17-character VIN from the ISO-TP response.
-bool requestVehicleVin(
-    char outputVin[VIN_LENGTH + 1])
+bool requestVehicleVin(char outputVin[VIN_LENGTH + 1])
 {
     clearReceiveQueue();
 
 
     twai_message_t request = {};
 
-    request.identifier =
-        OBD_FUNCTIONAL_REQUEST_ID;
+    request.identifier = OBD_FUNCTIONAL_REQUEST_ID;
 
     request.extd = 0;
     request.rtr = 0;
@@ -1361,9 +1233,7 @@ bool requestVehicleVin(
     request.data[7] = 0x00;
 
 
-    if (twai_transmit(
-            &request,
-            pdMS_TO_TICKS(20)) != ESP_OK)
+    if (twai_transmit(&request, pdMS_TO_TICKS(20)) != ESP_OK)
     {
         return false;
     }
@@ -1371,8 +1241,7 @@ bool requestVehicleVin(
 
     // Bytes collected after the positive
     // response service byte 0x49.
-    uint8_t responsePayload[
-        VIN_RESPONSE_BUFFER_SIZE] = {};
+    uint8_t responsePayload[VIN_RESPONSE_BUFFER_SIZE] = {};
 
     size_t responseLength = 0;
 
@@ -1384,44 +1253,33 @@ bool requestVehicleVin(
 
     uint8_t expectedSequenceNumber = 1;
 
-    const uint32_t requestStartTime =
-        millis();
+    const uint32_t requestStartTime = millis();
 
 
-    while (
-        millis() - requestStartTime <
-        VIN_RESPONSE_TIMEOUT_MS)
+    while (millis() - requestStartTime < VIN_RESPONSE_TIMEOUT_MS)
     {
         twai_message_t response = {};
 
 
-        if (twai_receive(
-                &response,
-                pdMS_TO_TICKS(10)) != ESP_OK)
+        if (twai_receive(&response, pdMS_TO_TICKS(10)) != ESP_OK)
         {
             continue;
         }
 
 
-        if (response.extd ||
-            response.rtr)
+        if (response.extd || response.rtr)
         {
             continue;
         }
 
 
-        if (response.identifier <
-                OBD_RESPONSE_MIN_ID ||
-            response.identifier >
-                OBD_RESPONSE_MAX_ID)
+        if (response.identifier < OBD_RESPONSE_MIN_ID || response.identifier > OBD_RESPONSE_MAX_ID)
         {
             continue;
         }
 
 
-        if (selectedEcuResponseId != 0 &&
-            response.identifier !=
-                selectedEcuResponseId)
+        if (selectedEcuResponseId != 0 && response.identifier != selectedEcuResponseId)
         {
             continue;
         }
@@ -1433,24 +1291,19 @@ bool requestVehicleVin(
         }
 
 
-        const uint8_t frameType =
-            response.data[0] >> 4;
+        const uint8_t frameType = response.data[0] >> 4;
 
 
         // ----------------------------------------------------
         // Single frame
         // ----------------------------------------------------
 
-        if (!multiFrameActive &&
-            frameType == 0x00)
+        if (!multiFrameActive && frameType == 0x00)
         {
-            const uint8_t isoTpLength =
-                response.data[0] & 0x0F;
+            const uint8_t isoTpLength = response.data[0] & 0x0F;
 
 
-            if (isoTpLength < 1 ||
-                response.data_length_code <
-                    1 + isoTpLength)
+            if (isoTpLength < 1 || response.data_length_code < 1 + isoTpLength)
             {
                 continue;
             }
@@ -1463,12 +1316,10 @@ bool requestVehicleVin(
             }
 
 
-            const size_t bytesAfterService =
-                isoTpLength - 1;
+            const size_t bytesAfterService = isoTpLength - 1;
 
 
-            if (bytesAfterService >
-                VIN_RESPONSE_BUFFER_SIZE)
+            if (bytesAfterService > VIN_RESPONSE_BUFFER_SIZE)
             {
                 return false;
             }
@@ -1476,28 +1327,19 @@ bool requestVehicleVin(
 
             if (selectedEcuResponseId == 0)
             {
-                selectedEcuResponseId =
-                    response.identifier;
+                selectedEcuResponseId = response.identifier;
 
-                Serial.printf(
-                    "Selected ECU response ID: "
-                    "0x%03lX\n",
-                    static_cast<unsigned long>(
-                        selectedEcuResponseId));
+                Serial.printf("Selected ECU response ID: " "0x%03lX\n", static_cast<unsigned long>(selectedEcuResponseId));
             }
 
 
-            for (size_t i = 0;
-                 i < bytesAfterService;
-                 i++)
+            for (size_t i = 0; i < bytesAfterService; i++)
             {
-                responsePayload[i] =
-                    response.data[2 + i];
+                responsePayload[i] = response.data[2 + i];
             }
 
 
-            responseLength =
-                bytesAfterService;
+            responseLength = bytesAfterService;
 
             break;
         }
@@ -1507,8 +1349,7 @@ bool requestVehicleVin(
         // First frame
         // ----------------------------------------------------
 
-        if (!multiFrameActive &&
-            frameType == 0x01)
+        if (!multiFrameActive && frameType == 0x01)
         {
             if (response.data_length_code < 4)
             {
@@ -1516,11 +1357,7 @@ bool requestVehicleVin(
             }
 
 
-            const size_t totalIsoTpLength =
-                (static_cast<size_t>(
-                     response.data[0] & 0x0F)
-                 << 8) |
-                response.data[1];
+            const size_t totalIsoTpLength = (static_cast<size_t>(response.data[0] & 0x0F) << 8) | response.data[1];
 
 
             if (totalIsoTpLength < 1)
@@ -1537,12 +1374,10 @@ bool requestVehicleVin(
 
 
             // We strip the 0x49 service byte.
-            expectedResponseLength =
-                totalIsoTpLength - 1;
+            expectedResponseLength = totalIsoTpLength - 1;
 
 
-            if (expectedResponseLength >
-                VIN_RESPONSE_BUFFER_SIZE)
+            if (expectedResponseLength > VIN_RESPONSE_BUFFER_SIZE)
             {
                 return false;
             }
@@ -1550,51 +1385,37 @@ bool requestVehicleVin(
 
             if (selectedEcuResponseId == 0)
             {
-                selectedEcuResponseId =
-                    response.identifier;
+                selectedEcuResponseId = response.identifier;
 
-                Serial.printf(
-                    "Selected ECU response ID: "
-                    "0x%03lX\n",
-                    static_cast<unsigned long>(
-                        selectedEcuResponseId));
+                Serial.printf("Selected ECU response ID: " "0x%03lX\n", static_cast<unsigned long>(selectedEcuResponseId));
             }
 
 
-            multiFrameResponseId =
-                response.identifier;
+            multiFrameResponseId = response.identifier;
 
 
             // First-frame bytes after 0x49 begin
             // at response.data[3].
-            const size_t availableBytes =
-                response.data_length_code > 3
-                    ? response.data_length_code - 3
-                    : 0;
+            size_t availableBytes = 0;
+
+            if (response.data_length_code > 3) availableBytes = response.data_length_code - 3;
 
 
-            const size_t bytesToCopy =
-                availableBytes <
-                        expectedResponseLength
-                    ? availableBytes
-                    : expectedResponseLength;
+            size_t bytesToCopy = expectedResponseLength;
+
+            if (availableBytes < expectedResponseLength) bytesToCopy = availableBytes;
 
 
-            for (size_t i = 0;
-                 i < bytesToCopy;
-                 i++)
+            for (size_t i = 0; i < bytesToCopy; i++)
             {
-                responsePayload[i] =
-                    response.data[3 + i];
+                responsePayload[i] = response.data[3 + i];
             }
 
 
-            responseLength =
-                bytesToCopy;
+            responseLength = bytesToCopy;
 
 
-            if (!sendIsoTpFlowControl(
-                    multiFrameResponseId))
+            if (!sendIsoTpFlowControl(multiFrameResponseId))
             {
                 return false;
             }
@@ -1612,64 +1433,46 @@ bool requestVehicleVin(
         // Consecutive frames
         // ----------------------------------------------------
 
-        if (multiFrameActive &&
-            response.identifier ==
-                multiFrameResponseId &&
-            frameType == 0x02)
+        if (multiFrameActive && response.identifier == multiFrameResponseId && frameType == 0x02)
         {
-            const uint8_t sequenceNumber =
-                response.data[0] & 0x0F;
+            const uint8_t sequenceNumber = response.data[0] & 0x0F;
 
 
-            if (sequenceNumber !=
-                expectedSequenceNumber)
+            if (sequenceNumber != expectedSequenceNumber)
             {
-                Serial.println(
-                    "VIN ISO-TP sequence mismatch.");
+                Serial.println("VIN ISO-TP sequence mismatch.");
 
                 return false;
             }
 
 
-            expectedSequenceNumber =
-                (expectedSequenceNumber + 1) &
-                0x0F;
+            expectedSequenceNumber = (expectedSequenceNumber + 1) & 0x0F;
 
 
-            const size_t remainingBytes =
-                expectedResponseLength -
-                responseLength;
+            const size_t remainingBytes = expectedResponseLength - responseLength;
 
 
-            const size_t availableBytes =
-                response.data_length_code > 1
-                    ? response.data_length_code - 1
-                    : 0;
+            size_t availableBytes = 0;
+
+            if (response.data_length_code > 1) availableBytes = response.data_length_code - 1;
 
 
-            const size_t bytesToCopy =
-                availableBytes <
-                        remainingBytes
-                    ? availableBytes
-                    : remainingBytes;
+            size_t bytesToCopy = remainingBytes;
+
+            if (availableBytes < remainingBytes) bytesToCopy = availableBytes;
 
 
-            for (size_t i = 0;
-                 i < bytesToCopy;
-                 i++)
+            for (size_t i = 0; i < bytesToCopy; i++)
             {
-                responsePayload[
-                    responseLength + i] =
+                responsePayload[responseLength + i] =
                     response.data[1 + i];
             }
 
 
-            responseLength +=
-                bytesToCopy;
+            responseLength += bytesToCopy;
 
 
-            if (responseLength >=
-                expectedResponseLength)
+            if (responseLength >= expectedResponseLength)
             {
                 break;
             }
@@ -1683,8 +1486,7 @@ bool requestVehicleVin(
     //
     // 02 = PID
     // 01 = one VIN data item
-    if (responseLength <
-        VIN_LENGTH + 2)
+    if (responseLength < VIN_LENGTH + 2)
     {
         return false;
     }
@@ -1702,40 +1504,30 @@ bool requestVehicleVin(
     }
 
 
-    for (size_t i = 0;
-         i < VIN_LENGTH;
-         i++)
+    for (size_t i = 0; i < VIN_LENGTH; i++)
     {
-        char vinCharacter =
-            static_cast<char>(
-                responsePayload[2 + i]);
+        char vinCharacter = static_cast<char>(responsePayload[2 + i]);
 
 
         // Normalize lowercase ASCII if an unusual
         // ECU returns it.
-        if (vinCharacter >= 'a' &&
-            vinCharacter <= 'z')
+        if (vinCharacter >= 'a' && vinCharacter <= 'z')
         {
-            vinCharacter =
-                static_cast<char>(
-                    vinCharacter - 'a' + 'A');
+            vinCharacter = static_cast<char>(vinCharacter - 'a' + 'A');
         }
 
 
-        if (!isValidVinCharacter(
-                vinCharacter))
+        if (!isValidVinCharacter(vinCharacter))
         {
             return false;
         }
 
 
-        outputVin[i] =
-            vinCharacter;
+        outputVin[i] = vinCharacter;
     }
 
 
-    outputVin[VIN_LENGTH] =
-        '\0';
+    outputVin[VIN_LENGTH] = '\0';
 
 
     return true;
@@ -1750,74 +1542,58 @@ bool requestVehicleVin(
 void performVehicleInfoReadAndSend()
 {
     Serial.println();
-    Serial.println(
-        "=== VEHICLE INFORMATION READ STARTED ===");
+    Serial.println("=== VEHICLE INFORMATION READ STARTED ===");
 
 
     char vin[VIN_LENGTH + 1] = {};
 
 
-    const bool success =
-        requestVehicleVin(vin);
+    const bool success = requestVehicleVin(vin);
 
 
     JsonDocument doc;
 
-    doc["type"] =
-        "vehicle_info";
+    doc["type"] = "vehicle_info";
 
-    doc["success"] =
-        success;
+    doc["success"] = success;
 
 
     if (success)
     {
-        doc["vin"] =
-            vin;
+        doc["vin"] = vin;
 
 
-        Serial.print(
-            "VIN: ");
+        Serial.print("VIN: ");
 
-        Serial.println(
-            vin);
+        Serial.println(vin);
     }
     else
     {
-        doc["vin"] =
-            nullptr;
+        doc["vin"] = nullptr;
 
-        doc["error"] =
-            "No valid VIN response received";
+        doc["error"] = "No valid VIN response received";
 
 
-        Serial.println(
-            "VIN unavailable.");
+        Serial.println("VIN unavailable.");
     }
 
 
     String jsonPayload;
 
-    serializeJson(
-        doc,
-        jsonPayload);
+    serializeJson(doc, jsonPayload);
 
 
     Serial.println();
-    Serial.println(
-        "--- VEHICLE INFO JSON ---");
+    Serial.println("--- VEHICLE INFO JSON ---");
 
-    Serial.println(
-        jsonPayload);
+    Serial.println(jsonPayload);
 
 
-    sendJsonPayloadOverBle(
-        jsonPayload);
+    sendJsonPayloadOverBle(jsonPayload);
 
 
     Serial.println();
-    Serial.println(
-        "=== VEHICLE INFORMATION READ COMPLETE ===");
+    Serial.println("=== VEHICLE INFORMATION READ COMPLETE ===");
 }
 
 // Complete sample collection
@@ -1942,9 +1718,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 25: Wideband O2 Sensor 2
     // Used as a fallback for Bank 1 downstream voltage when PID 15 was unavailable
-    if (
-        !sample.o2B1S2VoltageValid &&
-        requestMode01Pid(0x25, data, 4))
+    if (!sample.o2B1S2VoltageValid && requestMode01Pid(0x25, data, 4))
     {
         sample.o2B1S2Voltage = decodeWidebandVoltage(data[2], data[3]);
 
@@ -1956,8 +1730,7 @@ void collectOneSample(VehicleSample& sample)
     // Normally represents Bank 2 Sensor 1 in a two-bank layout
     if (requestMode01Pid(0x28, data, 4))
     {
-        sample.o2B2S1EquivalenceRatio =
-            decodeWidebandEquivalenceRatio(data[0], data[1]);
+        sample.o2B2S1EquivalenceRatio = decodeWidebandEquivalenceRatio(data[0], data[1]);
 
         sample.o2B2S1EquivalenceRatioValid = true;
 
@@ -1973,9 +1746,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 29: Wideband O2 Sensor 6
     // Used as a fallback for Bank 2 downstream voltage when PID 19 was unavailable
-    if (
-        !sample.o2B2S2VoltageValid &&
-        requestMode01Pid(0x29, data, 4))
+    if (!sample.o2B2S2VoltageValid && requestMode01Pid(0x29, data, 4))
     {
         sample.o2B2S2Voltage = decodeWidebandVoltage(data[2], data[3]);
 
@@ -2313,9 +2084,7 @@ FuelCaseFeatures calculateFuelFeatures(const VehicleSample samples[CASE_SIZE])
     result.ready =
         rpm.validCount >= MIN_VALID_SAMPLES &&
         load.validCount >= MIN_VALID_SAMPLES &&
-        selectedStft.validCount >= MIN_VALID_SAMPLES &&
-        selectedLtft.validCount >= MIN_VALID_SAMPLES &&
-        selectedTotalTrim.validCount >= MIN_VALID_SAMPLES;
+        selectedStft.validCount >= MIN_VALID_SAMPLES && selectedLtft.validCount >= MIN_VALID_SAMPLES && selectedTotalTrim.validCount >= MIN_VALID_SAMPLES;
 
     return result;
 }
@@ -2325,12 +2094,7 @@ FuelCaseFeatures calculateFuelFeatures(const VehicleSample samples[CASE_SIZE])
 // ------------------------------------------------------------
 
 // Calculates catalyst features for one bank
-CatalystBankFeatures calculateCatalystBankFeatures(
-    const ValueStatistics& upstreamVoltage,
-    const ValueStatistics& upstreamEquivalenceRatio,
-    const float downstreamValues[CASE_SIZE],
-    const bool downstreamValid[CASE_SIZE],
-    const ValueStatistics& downstreamVoltage)
+CatalystBankFeatures calculateCatalystBankFeatures(const ValueStatistics& upstreamVoltage, const ValueStatistics& upstreamEquivalenceRatio, const float downstreamValues[CASE_SIZE], const bool downstreamValid[CASE_SIZE], const ValueStatistics& downstreamVoltage)
 {
     CatalystBankFeatures result = {};
 
@@ -2345,17 +2109,11 @@ CatalystBankFeatures calculateCatalystBankFeatures(
 
     // The final V4 catalyst data requires enough samples and enough
     // signal movement for the O2 readings to be diagnostically useful
-    bool voltageReliable =
-        upstreamVoltage.validCount >= MIN_VALID_SAMPLES &&
-        upstreamVoltage.standardDeviation >= 0.01f;
+    bool voltageReliable = upstreamVoltage.validCount >= MIN_VALID_SAMPLES && upstreamVoltage.standardDeviation >= 0.01f;
 
-    bool equivalenceRatioReliable =
-        upstreamEquivalenceRatio.validCount >= MIN_VALID_SAMPLES &&
-        upstreamEquivalenceRatio.standardDeviation >= 0.01f;
+    bool equivalenceRatioReliable = upstreamEquivalenceRatio.validCount >= MIN_VALID_SAMPLES && upstreamEquivalenceRatio.standardDeviation >= 0.01f;
 
-    bool downstreamReliable =
-        downstreamVoltage.validCount >= MIN_VALID_SAMPLES &&
-        downstreamVoltage.standardDeviation >= 0.005f;
+    bool downstreamReliable = downstreamVoltage.validCount >= MIN_VALID_SAMPLES && downstreamVoltage.standardDeviation >= 0.005f;
 
 
     // Upstream voltage is preferred
@@ -2417,9 +2175,7 @@ CatalystBankFeatures calculateCatalystBankFeatures(
     // Calculate changes between consecutive valid downstream readings
     for (size_t i = 1; i < validDownstreamCount; i++)
     {
-        float currentStep =
-            validDownstreamValues[i] -
-            validDownstreamValues[i - 1];
+        float currentStep = validDownstreamValues[i] - validDownstreamValues[i - 1];
 
         downstreamSteps[stepCount] = currentStep;
 
@@ -2437,8 +2193,7 @@ CatalystBankFeatures calculateCatalystBankFeatures(
     }
 
 
-    float meanAbsoluteStep =
-        static_cast<float>(absoluteStepSum / stepCount);
+    float meanAbsoluteStep = static_cast<float>(absoluteStepSum / stepCount);
 
     double meanStep = stepSum / stepCount;
 
@@ -2448,35 +2203,22 @@ CatalystBankFeatures calculateCatalystBankFeatures(
     // Population STD of the signed downstream changes
     for (size_t i = 0; i < stepCount; i++)
     {
-        double difference =
-            downstreamSteps[i] -
-            meanStep;
+        double difference = downstreamSteps[i] - meanStep;
 
-        squaredStepDifferenceSum +=
-            difference * difference;
+        squaredStepDifferenceSum += difference * difference;
     }
 
 
-    float stepStandardDeviation =
-        static_cast<float>(
-            sqrt(
-                squaredStepDifferenceSum /
-                stepCount
-            )
-        );
+    float stepStandardDeviation = static_cast<float>(sqrt(squaredStepDifferenceSum / stepCount));
 
 
-    result.downstreamStandardDeviation =
-        downstreamVoltage.standardDeviation;
+    result.downstreamStandardDeviation = downstreamVoltage.standardDeviation;
 
-    result.downstreamRange =
-        downstreamVoltage.range;
+    result.downstreamRange = downstreamVoltage.range;
 
-    result.downstreamMeanAbsoluteStep =
-        meanAbsoluteStep;
+    result.downstreamMeanAbsoluteStep = meanAbsoluteStep;
 
-    result.downstreamStepStandardDeviation =
-        stepStandardDeviation;
+    result.downstreamStepStandardDeviation = stepStandardDeviation;
 
     result.available = true;
 
@@ -2669,62 +2411,24 @@ CatalystCaseFeatures calculateCatalystFeatures(const VehicleSample samples[CASE_
     }
 
 
-    ValueStatistics upstreamB1Voltage =
-        calculateStatistics(
-            upstreamB1VoltageValues,
-            upstreamB1VoltageValid
-        );
+    ValueStatistics upstreamB1Voltage = calculateStatistics(upstreamB1VoltageValues, upstreamB1VoltageValid);
 
-    ValueStatistics upstreamB1Equivalence =
-        calculateStatistics(
-            upstreamB1EquivalenceValues,
-            upstreamB1EquivalenceValid
-        );
+    ValueStatistics upstreamB1Equivalence = calculateStatistics(upstreamB1EquivalenceValues, upstreamB1EquivalenceValid);
 
-    ValueStatistics downstreamB1Voltage =
-        calculateStatistics(
-            downstreamB1VoltageValues,
-            downstreamB1VoltageValid
-        );
+    ValueStatistics downstreamB1Voltage = calculateStatistics(downstreamB1VoltageValues, downstreamB1VoltageValid);
 
 
-    ValueStatistics upstreamB2Voltage =
-        calculateStatistics(
-            upstreamB2VoltageValues,
-            upstreamB2VoltageValid
-        );
+    ValueStatistics upstreamB2Voltage = calculateStatistics(upstreamB2VoltageValues, upstreamB2VoltageValid);
 
-    ValueStatistics upstreamB2Equivalence =
-        calculateStatistics(
-            upstreamB2EquivalenceValues,
-            upstreamB2EquivalenceValid
-        );
+    ValueStatistics upstreamB2Equivalence = calculateStatistics(upstreamB2EquivalenceValues, upstreamB2EquivalenceValid);
 
-    ValueStatistics downstreamB2Voltage =
-        calculateStatistics(
-            downstreamB2VoltageValues,
-            downstreamB2VoltageValid
-        );
+    ValueStatistics downstreamB2Voltage = calculateStatistics(downstreamB2VoltageValues, downstreamB2VoltageValid);
 
 
-    CatalystBankFeatures bank1 =
-        calculateCatalystBankFeatures(
-            upstreamB1Voltage,
-            upstreamB1Equivalence,
-            downstreamB1VoltageValues,
-            downstreamB1VoltageValid,
-            downstreamB1Voltage
-        );
+    CatalystBankFeatures bank1 = calculateCatalystBankFeatures(upstreamB1Voltage, upstreamB1Equivalence, downstreamB1VoltageValues, downstreamB1VoltageValid, downstreamB1Voltage);
 
 
-    CatalystBankFeatures bank2 =
-        calculateCatalystBankFeatures(
-            upstreamB2Voltage,
-            upstreamB2Equivalence,
-            downstreamB2VoltageValues,
-            downstreamB2VoltageValid,
-            downstreamB2Voltage
-        );
+    CatalystBankFeatures bank2 = calculateCatalystBankFeatures(upstreamB2Voltage, upstreamB2Equivalence, downstreamB2VoltageValues, downstreamB2VoltageValid, downstreamB2Voltage);
 
 
     if (!bank1.available && !bank2.available)
@@ -2752,26 +2456,20 @@ CatalystCaseFeatures calculateCatalystFeatures(const VehicleSample samples[CASE_
 
         if (bank1.useUpstreamVoltage)
         {
-            selectedUpstreamValues =
-                upstreamB1VoltageValues;
+            selectedUpstreamValues = upstreamB1VoltageValues;
 
-            selectedUpstreamValid =
-                upstreamB1VoltageValid;
+            selectedUpstreamValid = upstreamB1VoltageValid;
         }
         else
         {
-            selectedUpstreamValues =
-                upstreamB1EquivalenceValues;
+            selectedUpstreamValues = upstreamB1EquivalenceValues;
 
-            selectedUpstreamValid =
-                upstreamB1EquivalenceValid;
+            selectedUpstreamValid = upstreamB1EquivalenceValid;
         }
 
-        selectedDownstreamValues =
-            downstreamB1VoltageValues;
+        selectedDownstreamValues = downstreamB1VoltageValues;
 
-        selectedDownstreamValid =
-            downstreamB1VoltageValid;
+        selectedDownstreamValid = downstreamB1VoltageValid;
     }
     else
     {
@@ -2781,66 +2479,48 @@ CatalystCaseFeatures calculateCatalystFeatures(const VehicleSample samples[CASE_
 
         if (bank2.useUpstreamVoltage)
         {
-            selectedUpstreamValues =
-                upstreamB2VoltageValues;
+            selectedUpstreamValues = upstreamB2VoltageValues;
 
-            selectedUpstreamValid =
-                upstreamB2VoltageValid;
+            selectedUpstreamValid = upstreamB2VoltageValid;
         }
         else
         {
-            selectedUpstreamValues =
-                upstreamB2EquivalenceValues;
+            selectedUpstreamValues = upstreamB2EquivalenceValues;
 
-            selectedUpstreamValid =
-                upstreamB2EquivalenceValid;
+            selectedUpstreamValid = upstreamB2EquivalenceValid;
         }
 
-        selectedDownstreamValues =
-            downstreamB2VoltageValues;
+        selectedDownstreamValues = downstreamB2VoltageValues;
 
-        selectedDownstreamValid =
-            downstreamB2VoltageValid;
+        selectedDownstreamValid = downstreamB2VoltageValid;
     }
 
 
     float maximumCorrelation = NAN;
 
 
-    if (!calculateMaximumLaggedCorrelation(
-        selectedUpstreamValues,
-        selectedUpstreamValid,
-        selectedDownstreamValues,
-        selectedDownstreamValid,
-        maximumCorrelation))
+    if (!calculateMaximumLaggedCorrelation(selectedUpstreamValues, selectedUpstreamValid, selectedDownstreamValues, selectedDownstreamValid, maximumCorrelation))
     {
         return result;
     }
 
 
-    result.maximumLaggedCorrelation =
-        maximumCorrelation;
+    result.maximumLaggedCorrelation = maximumCorrelation;
 
-    result.maximumLaggedCorrelationValid =
-        true;
+    result.maximumLaggedCorrelationValid = true;
 
 
     // Final V4 catalyst feature order
 
-    result.values[0] =
-        maximumCorrelation;
+    result.values[0] = maximumCorrelation;
 
-    result.values[1] =
-        selectedBank.downstreamStandardDeviation;
+    result.values[1] = selectedBank.downstreamStandardDeviation;
 
-    result.values[2] =
-        selectedBank.downstreamRange;
+    result.values[2] = selectedBank.downstreamRange;
 
-    result.values[3] =
-        selectedBank.downstreamMeanAbsoluteStep;
+    result.values[3] = selectedBank.downstreamMeanAbsoluteStep;
 
-    result.values[4] =
-        selectedBank.downstreamStepStandardDeviation;
+    result.values[4] = selectedBank.downstreamStepStandardDeviation;
 
 
     result.ready = true;
@@ -2936,9 +2616,7 @@ ChargingCaseFeatures calculateChargingFeatures(const VehicleSample samples[CASE_
     // Calculate the change between consecutive valid voltage readings
     for (size_t i = 1; i < validVoltageCount; i++)
     {
-        float currentStep =
-            validVoltageValues[i] -
-            validVoltageValues[i - 1];
+        float currentStep = validVoltageValues[i] - validVoltageValues[i - 1];
 
 
         voltageSteps[stepCount] = currentStep;
@@ -2973,23 +2651,14 @@ ChargingCaseFeatures calculateChargingFeatures(const VehicleSample samples[CASE_
     // Population STD of the signed voltage changes
     for (size_t i = 0; i < stepCount; i++)
     {
-        double difference =
-            voltageSteps[i] -
-            meanStep;
+        double difference = voltageSteps[i] - meanStep;
 
 
-        squaredStepDifferenceSum +=
-            difference * difference;
+        squaredStepDifferenceSum += difference * difference;
     }
 
 
-    float stepStandardDeviation =
-        static_cast<float>(
-            sqrt(
-                squaredStepDifferenceSum /
-                stepCount
-            )
-        );
+    float stepStandardDeviation = static_cast<float>(sqrt(squaredStepDifferenceSum / stepCount));
 
 
     // Final V4 charging feature order
@@ -3046,13 +2715,11 @@ class PistonBleServerCallbacks : public BLEServerCallbacks
         // A lost Bluetooth connection automatically
         // pauses logging so completed cases cannot be
         // silently lost while the app is disconnected.
-        pendingLoggingCommand.store(
-            LOGGING_COMMAND_PAUSE);
+        pendingLoggingCommand.store(LOGGING_COMMAND_PAUSE);
 
         Serial.println();
         Serial.println("BLE client disconnected.");
-        Serial.println(
-            "Logging pause queued because BLE disconnected.");
+        Serial.println("Logging pause queued because BLE disconnected.");
 
         server->startAdvertising();
 
@@ -3065,11 +2732,9 @@ class PistonBleServerCallbacks : public BLEServerCallbacks
 // ------------------------------------------------------------
 class PistonBleCommandCallbacks : public BLECharacteristicCallbacks
 {
-    void onWrite(
-        BLECharacteristic* characteristic) override
+    void onWrite(BLECharacteristic* characteristic) override
     {
-        std::string command =
-            characteristic->getValue();
+        std::string command = characteristic->getValue();
 
         if (command.empty())
         {
@@ -3083,27 +2748,21 @@ class PistonBleCommandCallbacks : public BLECharacteristicCallbacks
 
         if (command == "start_logging")
         {
-            pendingLoggingCommand.store(
-                LOGGING_COMMAND_START);
+            pendingLoggingCommand.store(LOGGING_COMMAND_START);
 
-            Serial.println(
-                "Start logging command queued.");
+            Serial.println("Start logging command queued.");
         }
         else if (command == "pause_logging")
         {
-            pendingLoggingCommand.store(
-                LOGGING_COMMAND_PAUSE);
+            pendingLoggingCommand.store(LOGGING_COMMAND_PAUSE);
 
-            Serial.println(
-                "Pause logging command queued.");
+            Serial.println("Pause logging command queued.");
         }
         else if (command == "get_logging_status")
         {
-            pendingLoggingCommand.store(
-                LOGGING_COMMAND_STATUS);
+            pendingLoggingCommand.store(LOGGING_COMMAND_STATUS);
 
-            Serial.println(
-                "Logging status request queued.");
+            Serial.println("Logging status request queued.");
         }
         else if (command == "read_dtcs")
         {
@@ -3117,11 +2776,9 @@ class PistonBleCommandCallbacks : public BLECharacteristicCallbacks
         }
         else
         {
-            Serial.print(
-                "Unknown BLE command: ");
+            Serial.print("Unknown BLE command: ");
 
-            Serial.println(
-                command.c_str());
+            Serial.println(command.c_str());
         }
     }
 };
@@ -3131,11 +2788,7 @@ class PistonBleCommandCallbacks : public BLECharacteristicCallbacks
 
 // Adds a floating-point value to JSON.
 // Invalid or non-finite values are written as JSON null.
-void addJsonFloat(
-    JsonObject object,
-    const char* key,
-    float value,
-    bool valid)
+void addJsonFloat(JsonObject object, const char* key, float value, bool valid)
 {
     if (valid && isfinite(value))
     {
@@ -3149,10 +2802,7 @@ void addJsonFloat(
 
 
 // Adds a floating-point value when no separate valid flag exists.
-void addJsonFloat(
-    JsonObject object,
-    const char* key,
-    float value)
+void addJsonFloat(JsonObject object, const char* key, float value)
 {
     if (isfinite(value))
     {
@@ -3166,9 +2816,7 @@ void addJsonFloat(
 
 
 // Builds one complete JSON document from a completed case.
-void buildCompletedCaseJson(
-    const CompletedCaseToTransmit& completedCase,
-    JsonDocument& doc)
+void buildCompletedCaseJson(const CompletedCaseToTransmit& completedCase, JsonDocument& doc)
 {
     doc.clear();
 
@@ -3180,128 +2828,65 @@ void buildCompletedCaseJson(
     // Raw 20-sample case
     // --------------------------------------------------------
 
-    JsonArray samplesJson =
-        doc["samples"].to<JsonArray>();
+    JsonArray samplesJson = doc["samples"].to<JsonArray>();
 
     for (size_t i = 0; i < CASE_SIZE; i++)
     {
-        const VehicleSample& sample =
-            completedCase.samples[i];
+        const VehicleSample& sample = completedCase.samples[i];
 
-        JsonObject sampleJson =
-            samplesJson.add<JsonObject>();
+        JsonObject sampleJson = samplesJson.add<JsonObject>();
 
         sampleJson["sample_index"] = i;
         sampleJson["time_ms"] = sample.timestampMs;
 
-        addJsonFloat(
-            sampleJson,
-            "engine_load",
-            sample.engineLoad,
-            sample.engineLoadValid);
+        addJsonFloat(sampleJson, "engine_load", sample.engineLoad, sample.engineLoadValid);
 
-        addJsonFloat(
-            sampleJson,
-            "stft_b1",
-            sample.stftB1,
-            sample.stftB1Valid);
+        addJsonFloat(sampleJson, "stft_b1", sample.stftB1, sample.stftB1Valid);
 
-        addJsonFloat(
-            sampleJson,
-            "ltft_b1",
-            sample.ltftB1,
-            sample.ltftB1Valid);
+        addJsonFloat(sampleJson, "ltft_b1", sample.ltftB1, sample.ltftB1Valid);
 
-        addJsonFloat(
-            sampleJson,
-            "stft_b2",
-            sample.stftB2,
-            sample.stftB2Valid);
+        addJsonFloat(sampleJson, "stft_b2", sample.stftB2, sample.stftB2Valid);
 
-        addJsonFloat(
-            sampleJson,
-            "ltft_b2",
-            sample.ltftB2,
-            sample.ltftB2Valid);
+        addJsonFloat(sampleJson, "ltft_b2", sample.ltftB2, sample.ltftB2Valid);
 
-        addJsonFloat(
-            sampleJson,
-            "rpm",
-            sample.rpm,
-            sample.rpmValid);
+        addJsonFloat(sampleJson, "rpm", sample.rpm, sample.rpmValid);
 
-        addJsonFloat(
-            sampleJson,
-            "o2_b1s1_voltage",
-            sample.o2B1S1Voltage,
-            sample.o2B1S1VoltageValid);
+        addJsonFloat(sampleJson, "o2_b1s1_voltage", sample.o2B1S1Voltage, sample.o2B1S1VoltageValid);
 
-        addJsonFloat(
-            sampleJson,
-            "o2_b1s2_voltage",
-            sample.o2B1S2Voltage,
-            sample.o2B1S2VoltageValid);
+        addJsonFloat(sampleJson, "o2_b1s2_voltage", sample.o2B1S2Voltage, sample.o2B1S2VoltageValid);
 
-        addJsonFloat(
-            sampleJson,
-            "o2_b1s1_equiv",
-            sample.o2B1S1EquivalenceRatio,
-            sample.o2B1S1EquivalenceRatioValid);
+        addJsonFloat(sampleJson, "o2_b1s1_equiv", sample.o2B1S1EquivalenceRatio, sample.o2B1S1EquivalenceRatioValid);
 
-        addJsonFloat(
-            sampleJson,
-            "o2_b2s1_voltage",
-            sample.o2B2S1Voltage,
-            sample.o2B2S1VoltageValid);
+        addJsonFloat(sampleJson, "o2_b2s1_voltage", sample.o2B2S1Voltage, sample.o2B2S1VoltageValid);
 
-        addJsonFloat(
-            sampleJson,
-            "o2_b2s2_voltage",
-            sample.o2B2S2Voltage,
-            sample.o2B2S2VoltageValid);
+        addJsonFloat(sampleJson, "o2_b2s2_voltage", sample.o2B2S2Voltage, sample.o2B2S2VoltageValid);
 
-        addJsonFloat(
-            sampleJson,
-            "o2_b2s1_equiv",
-            sample.o2B2S1EquivalenceRatio,
-            sample.o2B2S1EquivalenceRatioValid);
+        addJsonFloat(sampleJson, "o2_b2s1_equiv", sample.o2B2S1EquivalenceRatio, sample.o2B2S1EquivalenceRatioValid);
 
-        addJsonFloat(
-            sampleJson,
-            "control_module_voltage",
-            sample.controlModuleVoltage,
-            sample.controlModuleVoltageValid);
+        addJsonFloat(sampleJson, "control_module_voltage", sample.controlModuleVoltage, sample.controlModuleVoltageValid);
     }
 
 
     // Diagnostic outputs
     // --------------------------------------------------------
 
-    JsonObject outputsJson =
-        doc["outputs"].to<JsonObject>();
+    JsonObject outputsJson = doc["outputs"].to<JsonObject>();
 
 
     // Fuel
     // --------------------------------------------------------
 
-    JsonObject fuelJson =
-        outputsJson["fuel"].to<JsonObject>();
+    JsonObject fuelJson = outputsJson["fuel"].to<JsonObject>();
 
-    fuelJson["available"] =
-        completedCase.fuel.available;
+    fuelJson["available"] = completedCase.fuel.available;
 
-    fuelJson["selected_bank"] =
-        completedCase.fuel.selectedBank;
+    fuelJson["selected_bank"] = completedCase.fuel.selectedBank;
 
-    JsonObject fuelFeaturesJson =
-        fuelJson["features"].to<JsonObject>();
+    JsonObject fuelFeaturesJson = fuelJson["features"].to<JsonObject>();
 
     for (size_t i = 0; i < 9; i++)
     {
-        addJsonFloat(
-            fuelFeaturesJson,
-            FUEL_FEATURE_NAMES[i],
-            completedCase.fuel.features[i]);
+        addJsonFloat(fuelFeaturesJson, FUEL_FEATURE_NAMES[i], completedCase.fuel.features[i]);
     }
 
     addJsonFloat(fuelJson, "anomaly_score", completedCase.fuel.anomalyScore);
@@ -3310,8 +2895,7 @@ void buildCompletedCaseJson(
 
     fuelJson["anomaly_alert"] = completedCase.fuel.anomalyAlert;
 
-    JsonObject fuelThresholdsJson =
-    fuelJson["thresholds"].to<JsonObject>();
+    JsonObject fuelThresholdsJson = fuelJson["thresholds"].to<JsonObject>();
 
     fuelThresholdsJson["monitor_total_trim"] = FUEL_KEEP_EYE_TRIM_THRESHOLD;
 
@@ -3331,59 +2915,38 @@ void buildCompletedCaseJson(
     // Catalyst
     // --------------------------------------------------------
 
-    JsonObject catalystJson =
-        outputsJson["catalyst"].to<JsonObject>();
+    JsonObject catalystJson = outputsJson["catalyst"].to<JsonObject>();
 
-    catalystJson["available"] =
-        completedCase.catalyst.available;
+    catalystJson["available"] = completedCase.catalyst.available;
 
-    catalystJson["selected_bank"] =
-        completedCase.catalyst.selectedBank;
+    catalystJson["selected_bank"] = completedCase.catalyst.selectedBank;
 
-    JsonObject catalystFeaturesJson =
-        catalystJson["features"].to<JsonObject>();
+    JsonObject catalystFeaturesJson = catalystJson["features"].to<JsonObject>();
 
     for (size_t i = 0; i < 5; i++)
     {
-        addJsonFloat(
-            catalystFeaturesJson,
-            CATALYST_FEATURE_NAMES[i],
-            completedCase.catalyst.features[i]);
+        addJsonFloat(catalystFeaturesJson, CATALYST_FEATURE_NAMES[i], completedCase.catalyst.features[i]);
     }
 
-    addJsonFloat(
-        catalystJson,
-        "anomaly_score",
-        completedCase.catalyst.anomalyScore);
+    addJsonFloat(catalystJson, "anomaly_score", completedCase.catalyst.anomalyScore);
 
-    catalystJson["anomaly_threshold"] =
-        completedCase.catalyst.anomalyThreshold;
+    catalystJson["anomaly_threshold"] = completedCase.catalyst.anomalyThreshold;
 
     catalystJson["anomaly_alert"] = completedCase.catalyst.isolationForestAlert;
 
-    addJsonFloat(
-        catalystJson,
-        "maximum_lagged_correlation",
-        completedCase.catalyst.maximumLaggedCorrelation,
-        completedCase.catalyst.maximumLaggedCorrelationValid);
+    addJsonFloat(catalystJson, "maximum_lagged_correlation", completedCase.catalyst.maximumLaggedCorrelation, completedCase.catalyst.maximumLaggedCorrelationValid);
 
-    catalystJson["mirroring_this_case"] =
-        completedCase.catalyst.mirroringThisCase;
+    catalystJson["mirroring_this_case"] = completedCase.catalyst.mirroringThisCase;
 
-    catalystJson["consecutive_mirroring_cases"] =
-        completedCase.catalyst.consecutiveMirroringCases;
+    catalystJson["consecutive_mirroring_cases"] = completedCase.catalyst.consecutiveMirroringCases;
 
-    catalystJson["persistent_mirroring"] =
-        completedCase.catalyst.persistentMirroring;
+    catalystJson["persistent_mirroring"] = completedCase.catalyst.persistentMirroring;
 
-    catalystJson["strong_mirroring_this_case"] =
-        completedCase.catalyst.strongMirroringThisCase;
+    catalystJson["strong_mirroring_this_case"] = completedCase.catalyst.strongMirroringThisCase;
 
-    catalystJson["consecutive_strong_mirroring_cases"] =
-        completedCase.catalyst.consecutiveStrongMirroringCases;
+    catalystJson["consecutive_strong_mirroring_cases"] = completedCase.catalyst.consecutiveStrongMirroringCases;
 
-    catalystJson["strong_persistent_mirroring"] =
-        completedCase.catalyst.strongPersistentMirroring;
+    catalystJson["strong_persistent_mirroring"] = completedCase.catalyst.strongPersistentMirroring;
 
     catalystJson["hybrid_alert"] = completedCase.catalyst.hybridAlert;
 
@@ -3411,78 +2974,52 @@ void buildCompletedCaseJson(
     // Charging
     // --------------------------------------------------------
 
-    JsonObject chargingJson =
-        outputsJson["charging"].to<JsonObject>();
+    JsonObject chargingJson = outputsJson["charging"].to<JsonObject>();
 
-    chargingJson["available"] =
-        completedCase.charging.available;
+    chargingJson["available"] = completedCase.charging.available;
 
-    JsonObject chargingFeaturesJson =
-        chargingJson["features"].to<JsonObject>();
+    JsonObject chargingFeaturesJson = chargingJson["features"].to<JsonObject>();
 
     for (size_t i = 0; i < 7; i++)
     {
-        addJsonFloat(
-            chargingFeaturesJson,
-            CHARGING_FEATURE_NAMES[i],
-            completedCase.charging.features[i]);
+        addJsonFloat(chargingFeaturesJson, CHARGING_FEATURE_NAMES[i], completedCase.charging.features[i]);
     }
 
-    addJsonFloat(
-        chargingJson,
-        "anomaly_score",
-        completedCase.charging.anomalyScore);
+    addJsonFloat(chargingJson, "anomaly_score", completedCase.charging.anomalyScore);
 
-    chargingJson["anomaly_threshold"] =
-        completedCase.charging.anomalyThreshold;
+    chargingJson["anomaly_threshold"] = completedCase.charging.anomalyThreshold;
 
-    chargingJson["anomaly_alert"] =
-        completedCase.charging.anomalyAlert;
+    chargingJson["anomaly_alert"] = completedCase.charging.anomalyAlert;
 
-    chargingJson["strong_charging_case"] =
-        completedCase.charging.strongChargingCase;
+    chargingJson["strong_charging_case"] = completedCase.charging.strongChargingCase;
 
-    chargingJson["consecutive_strong_cases"] =
-        completedCase.charging.consecutiveStrongCases;
+    chargingJson["consecutive_strong_cases"] = completedCase.charging.consecutiveStrongCases;
 
-    JsonObject chargingThresholdsJson =
-        chargingJson["thresholds"].to<JsonObject>();
+    JsonObject chargingThresholdsJson = chargingJson["thresholds"].to<JsonObject>();
 
-    chargingThresholdsJson["monitor_low_count"] =
-        CHARGING_KEEP_LOW_COUNT;
+    chargingThresholdsJson["monitor_low_count"] = CHARGING_KEEP_LOW_COUNT;
 
-    chargingThresholdsJson["monitor_high_count"] =
-        CHARGING_KEEP_HIGH_COUNT;
+    chargingThresholdsJson["monitor_high_count"] = CHARGING_KEEP_HIGH_COUNT;
 
-    chargingThresholdsJson["monitor_max_step"] =
-        CHARGING_KEEP_MAX_STEP;
+    chargingThresholdsJson["monitor_max_step"] = CHARGING_KEEP_MAX_STEP;
 
-    chargingThresholdsJson["monitor_step_std"] =
-        CHARGING_KEEP_STEP_STD;
+    chargingThresholdsJson["monitor_step_std"] = CHARGING_KEEP_STEP_STD;
 
-    chargingThresholdsJson["inspect_low_mean"] =
-        CHARGING_INSPECT_LOW_MEAN;
+    chargingThresholdsJson["inspect_low_mean"] = CHARGING_INSPECT_LOW_MEAN;
 
-    chargingThresholdsJson["inspect_high_mean"] =
-        CHARGING_INSPECT_HIGH_MEAN;
+    chargingThresholdsJson["inspect_high_mean"] = CHARGING_INSPECT_HIGH_MEAN;
 
-    chargingThresholdsJson["inspect_low_count"] =
-        CHARGING_INSPECT_LOW_COUNT;
+    chargingThresholdsJson["inspect_low_count"] = CHARGING_INSPECT_LOW_COUNT;
 
-    chargingThresholdsJson["inspect_high_count"] =
-        CHARGING_INSPECT_HIGH_COUNT;
+    chargingThresholdsJson["inspect_high_count"] = CHARGING_INSPECT_HIGH_COUNT;
 
-    chargingThresholdsJson["inspect_max_step"] =
-        CHARGING_INSPECT_MAX_STEP;
+    chargingThresholdsJson["inspect_max_step"] = CHARGING_INSPECT_MAX_STEP;
 
-    chargingThresholdsJson["inspect_step_std"] =
-        CHARGING_INSPECT_STEP_STD;
+    chargingThresholdsJson["inspect_step_std"] = CHARGING_INSPECT_STEP_STD;
 
-    chargingThresholdsJson["inspect_required_consecutive_cases"] =
-        CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES;
+    chargingThresholdsJson["inspect_required_consecutive_cases"] = CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES;
 
-    chargingJson["condition"] =
-        completedCase.charging.condition;
+    chargingJson["condition"] = completedCase.charging.condition;
 
     chargingJson["action_level"] = completedCase.charging.actionLevel;
 
@@ -3507,11 +3044,9 @@ void sendJsonPayloadOverBle(const String& jsonPayload)
     }
 
 
-    uint16_t connectionId =
-        bleServer->getConnId();
+    uint16_t connectionId = bleServer->getConnId();
 
-    uint16_t negotiatedMtu =
-        bleServer->getPeerMTU(connectionId);
+    uint16_t negotiatedMtu = bleServer->getPeerMTU(connectionId);
 
 
     // ATT notifications can carry MTU - 3 bytes.
@@ -3550,13 +3085,11 @@ void sendJsonPayloadOverBle(const String& jsonPayload)
         }
 
 
-        size_t remainingBytes =
-            jsonPayload.length() - offset;
+        size_t remainingBytes = jsonPayload.length() - offset;
 
-        size_t chunkSize =
-            remainingBytes < maximumChunkSize
-                ? remainingBytes
-                : maximumChunkSize;
+        size_t chunkSize = maximumChunkSize;
+
+        if (remainingBytes < maximumChunkSize) chunkSize = remainingBytes;
 
 
         memcpy(chunkBuffer, jsonPayload.c_str() + offset, chunkSize);
@@ -3575,7 +3108,7 @@ void sendJsonPayloadOverBle(const String& jsonPayload)
 
 
     // Newline marks the end of one complete JSON message.
-uint8_t endOfMessage = '\n';
+    uint8_t endOfMessage = '\n';
 
     bleTxCharacteristic->setValue(&endOfMessage, 1);
 
@@ -3757,11 +3290,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         // Inspect Soon also requires both evidence sources.
         // Severity is reached by either a large fuel-trim
         // deviation or a stronger Isolation Forest score.
-        bool fuelInspectEvidence = fuelAlert &&
-            (
-                totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD ||
-                (fuelScore >= FUEL_INSPECT_SCORE_THRESHOLD && fuelDiagnosticEvidence)
-            );
+        bool fuelInspectEvidence = fuelAlert && (totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD || (fuelScore >= FUEL_INSPECT_SCORE_THRESHOLD && fuelDiagnosticEvidence));
 
 
     if (fuelAlert && fuelDiagnosticEvidence)
@@ -3845,7 +3374,9 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         Serial.println(fuelResults.actionLevel);
 
         float signedTotalTrim = fuelFeatures.values[6];
-        float diagnosticThreshold = totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD ? FUEL_INSPECT_TRIM_THRESHOLD : FUEL_KEEP_EYE_TRIM_THRESHOLD;
+        float diagnosticThreshold = FUEL_KEEP_EYE_TRIM_THRESHOLD;
+
+        if (totalTrimMagnitude >= FUEL_INSPECT_TRIM_THRESHOLD) diagnosticThreshold = FUEL_INSPECT_TRIM_THRESHOLD;
         float trimAmountPastThreshold = totalTrimMagnitude - diagnosticThreshold;
 
         // 00 - Neither method detected abnormal behavior
@@ -3924,7 +3455,8 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         Serial.println("--- FUEL TRANSMIT STRUCT CHECK ---");
 
         Serial.print("Available: ");
-        Serial.println(fuelResults.available ? "YES" : "NO");
+        if (fuelResults.available) Serial.println("YES");
+        else Serial.println("NO");
 
         Serial.print("Selected bank: B");
         Serial.println(fuelResults.selectedBank);
@@ -3936,7 +3468,8 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         Serial.println(fuelResults.anomalyThreshold, 6);
 
         Serial.print("Stored alert: ");
-        Serial.println(fuelResults.anomalyAlert ? "YES" : "NO");
+        if (fuelResults.anomalyAlert) Serial.println("YES");
+        else Serial.println("NO");
 
         Serial.print("Stored condition: ");
         Serial.println(fuelResults.condition);
@@ -3972,22 +3505,12 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         Serial.print("Selected catalyst bank: B");
         Serial.println(catalystFeatures.selectedBank);
 
-        const char* catalystFeatureNames[5] =
-        {
-            "CAT_MAX_LAGGED_CORR",
-            "CAT_DOWNSTREAM_STD",
-            "CAT_DOWNSTREAM_RANGE",
-            "CAT_DOWNSTREAM_MEAN_ABS_STEP",
-            "CAT_DOWNSTREAM_STEP_STD"
-        };
+        const char* catalystFeatureNames[5] = {"CAT_MAX_LAGGED_CORR", "CAT_DOWNSTREAM_STD", "CAT_DOWNSTREAM_RANGE", "CAT_DOWNSTREAM_MEAN_ABS_STEP", "CAT_DOWNSTREAM_STEP_STD"};
 
 
         for (size_t i = 0; i < 5; i++)
         {
-            printFeature(
-                catalystFeatureNames[i],
-                catalystFeatures.values[i]
-            );
+            printFeature(catalystFeatureNames[i], catalystFeatures.values[i]);
         }
     }
 
@@ -4013,9 +3536,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         catalystResults.isolationForestAlert = catalystIfAlert;
 
         // Basic mirroring rule
-        bool catalystMirroringThisCase =
-            catalystFeatures.maximumLaggedCorrelationValid &&
-            catalystFeatures.maximumLaggedCorrelation >= CATALYST_CORRELATION_THRESHOLD;
+        bool catalystMirroringThisCase = catalystFeatures.maximumLaggedCorrelationValid && catalystFeatures.maximumLaggedCorrelation >= CATALYST_CORRELATION_THRESHOLD;
 
 
         uint8_t currentMirroringCount = 0;
@@ -4025,10 +3546,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         {
             if (catalystMirroringThisCase)
             {
-                if (
-                    catalystB2MirroringConsecutiveCases <
-                    CATALYST_REQUIRED_CONSECUTIVE_CASES
-                )
+                if (catalystB2MirroringConsecutiveCases < CATALYST_REQUIRED_CONSECUTIVE_CASES)
                 {
                     catalystB2MirroringConsecutiveCases++;
                 }
@@ -4038,17 +3556,13 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                 catalystB2MirroringConsecutiveCases = 0;
             }
 
-            currentMirroringCount =
-                catalystB2MirroringConsecutiveCases;
+            currentMirroringCount = catalystB2MirroringConsecutiveCases;
         }
         else
         {
             if (catalystMirroringThisCase)
             {
-                if (
-                    catalystB1MirroringConsecutiveCases <
-                    CATALYST_REQUIRED_CONSECUTIVE_CASES
-                )
+                if (catalystB1MirroringConsecutiveCases < CATALYST_REQUIRED_CONSECUTIVE_CASES)
                 {
                     catalystB1MirroringConsecutiveCases++;
                 }
@@ -4058,8 +3572,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                 catalystB1MirroringConsecutiveCases = 0;
             }
 
-            currentMirroringCount =
-                catalystB1MirroringConsecutiveCases;
+            currentMirroringCount = catalystB1MirroringConsecutiveCases;
         }
 
 
@@ -4073,10 +3586,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
 
         // Strong mirroring rule
-        bool catalystStrongMirroringThisCase =
-            catalystFeatures.maximumLaggedCorrelationValid &&
-            catalystFeatures.maximumLaggedCorrelation >=
-                CATALYST_STRONG_CORRELATION_THRESHOLD;
+        bool catalystStrongMirroringThisCase = catalystFeatures.maximumLaggedCorrelationValid && catalystFeatures.maximumLaggedCorrelation >= CATALYST_STRONG_CORRELATION_THRESHOLD;
 
 
         uint8_t currentStrongMirroringCount = 0;
@@ -4086,10 +3596,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         {
             if (catalystStrongMirroringThisCase)
             {
-                if (
-                    catalystB2StrongMirroringConsecutiveCases <
-                    CATALYST_STRONG_REQUIRED_CONSECUTIVE_CASES
-                )
+                if (catalystB2StrongMirroringConsecutiveCases < CATALYST_STRONG_REQUIRED_CONSECUTIVE_CASES)
                 {
                     catalystB2StrongMirroringConsecutiveCases++;
                 }
@@ -4099,17 +3606,13 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                 catalystB2StrongMirroringConsecutiveCases = 0;
             }
 
-            currentStrongMirroringCount =
-                catalystB2StrongMirroringConsecutiveCases;
+            currentStrongMirroringCount = catalystB2StrongMirroringConsecutiveCases;
         }
         else
         {
             if (catalystStrongMirroringThisCase)
             {
-                if (
-                    catalystB1StrongMirroringConsecutiveCases <
-                    CATALYST_STRONG_REQUIRED_CONSECUTIVE_CASES
-                )
+                if (catalystB1StrongMirroringConsecutiveCases < CATALYST_STRONG_REQUIRED_CONSECUTIVE_CASES)
                 {
                     catalystB1StrongMirroringConsecutiveCases++;
                 }
@@ -4134,39 +3637,23 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
         // Diagnostic evidence requires persistent oxygen-sensor
         // behavior rather than a single-case correlation
-        bool catalystDiagnosticEvidence =
-            catalystPersistentMirroring ||
-            catalystStrongPersistentMirroring;
+        bool catalystDiagnosticEvidence = catalystPersistentMirroring || catalystStrongPersistentMirroring;
 
 
         // Customer-facing catalyst alerts require agreement
         // between the Isolation Forest and diagnostic logic
-        bool catalystHybridAlert =
-            catalystIfAlert &&
-            catalystDiagnosticEvidence;
+        bool catalystHybridAlert = catalystIfAlert && catalystDiagnosticEvidence;
 
-        catalystResults.hybridAlert =
-            catalystHybridAlert;
+        catalystResults.hybridAlert = catalystHybridAlert;
 
 
-        bool catalystKeepEvidence =
-            catalystHybridAlert;
+        bool catalystKeepEvidence = catalystHybridAlert;
 
 
         // Inspect Soon also requires both evidence sources.
         // Strong persistent mirroring can provide the diagnostic
         // severity without requiring the higher IF score.
-        bool catalystInspectEvidence =
-            catalystIfAlert &&
-            (
-                (
-                    catalystScore >=
-                        CATALYST_INSPECT_SCORE_THRESHOLD &&
-                    catalystPersistentMirroring
-                )
-                ||
-                catalystStrongPersistentMirroring
-            );
+        bool catalystInspectEvidence = catalystIfAlert && ((catalystScore >= CATALYST_INSPECT_SCORE_THRESHOLD && catalystPersistentMirroring) || catalystStrongPersistentMirroring);
 
         if (catalystIfAlert && catalystDiagnosticEvidence)
         {
@@ -4210,10 +3697,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
         if (catalystFeatures.maximumLaggedCorrelationValid)
         {
-            Serial.println(
-                catalystFeatures.maximumLaggedCorrelation,
-                6
-            );
+            Serial.println(catalystFeatures.maximumLaggedCorrelation, 6);
         }
         else
         {
@@ -4436,45 +3920,30 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             CHARGING_IMPUTER_MEDIANS);
 
 
-        bool chargingAlert = pistonIsolationForestAlert(
-            chargingScore,
-            CHARGING_ANOMALY_THRESHOLD);
+        bool chargingAlert = pistonIsolationForestAlert(chargingScore, CHARGING_ANOMALY_THRESHOLD);
 
         chargingResults.anomalyScore = chargingScore;
         chargingResults.anomalyAlert = chargingAlert;
 
-        float meanVoltage =
-            chargingFeatures.values[0];
+        float meanVoltage = chargingFeatures.values[0];
 
-        float belowChargingCount =
-            chargingFeatures.values[3];
+        float belowChargingCount = chargingFeatures.values[3];
 
-        float aboveChargingCount =
-            chargingFeatures.values[4];
+        float aboveChargingCount = chargingFeatures.values[4];
 
-        float maximumVoltageStep =
-            chargingFeatures.values[5];
+        float maximumVoltageStep = chargingFeatures.values[5];
 
-        float voltageStepStandardDeviation =
-            chargingFeatures.values[6];
+        float voltageStepStandardDeviation = chargingFeatures.values[6];
 
 
         // Mild physical evidence
-        bool chargingLowMild =
-            belowChargingCount >=
-            CHARGING_KEEP_LOW_COUNT;
+        bool chargingLowMild = belowChargingCount >= CHARGING_KEEP_LOW_COUNT;
 
-        bool chargingHighMild =
-            aboveChargingCount >=
-            CHARGING_KEEP_HIGH_COUNT;
+        bool chargingHighMild = aboveChargingCount >= CHARGING_KEEP_HIGH_COUNT;
 
-        bool chargingStepMild =
-            maximumVoltageStep >=
-            CHARGING_KEEP_MAX_STEP;
+        bool chargingStepMild = maximumVoltageStep >= CHARGING_KEEP_MAX_STEP;
 
-        bool chargingStepStdMild =
-            voltageStepStandardDeviation >=
-            CHARGING_KEEP_STEP_STD;
+        bool chargingStepStdMild = voltageStepStandardDeviation >= CHARGING_KEEP_STEP_STD;
 
 
         uint8_t chargingMildEvidenceCount = 0;
@@ -4511,23 +3980,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             meanVoltage < CHARGING_INSPECT_LOW_MEAN ||
             meanVoltage > CHARGING_INSPECT_HIGH_MEAN ||
             belowChargingCount >= CHARGING_INSPECT_LOW_COUNT ||
-            aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT ||
-            maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP ||
-            voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
+            aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT || maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP || voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
 
         bool chargingMeanLowStrong = meanVoltage < CHARGING_INSPECT_LOW_MEAN;
 
-        bool chargingMeanHighStrong =
-            meanVoltage > CHARGING_INSPECT_HIGH_MEAN;
+        bool chargingMeanHighStrong = meanVoltage > CHARGING_INSPECT_HIGH_MEAN;
 
-        bool chargingLowCountStrong =
-            belowChargingCount >= CHARGING_INSPECT_LOW_COUNT;
+        bool chargingLowCountStrong = belowChargingCount >= CHARGING_INSPECT_LOW_COUNT;
 
-        bool chargingHighCountStrong =
-            aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT;
+        bool chargingHighCountStrong = aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT;
 
-        bool chargingStepStrong =
-            maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP;
+        bool chargingStepStrong = maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP;
 
         bool chargingStepStdStrong = voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
 
@@ -4551,8 +4014,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         else chargingStrongConsecutiveCases = 0;
 
 
-        bool chargingInspectEvidence =
-            chargingStrongConsecutiveCases >= CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES;
+        bool chargingInspectEvidence = chargingStrongConsecutiveCases >= CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES;
 
         chargingResults.consecutiveStrongCases = chargingStrongConsecutiveCases;
 
@@ -4621,14 +4083,12 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         {
             chargingResults.condition = "Normal";
         }
-        else if ( belowChargingCount > aboveChargingCount ||
-            meanVoltage < CHARGING_INSPECT_LOW_MEAN)
+        else if ( belowChargingCount > aboveChargingCount || meanVoltage < CHARGING_INSPECT_LOW_MEAN)
         {
             chargingResults.condition = "Low voltage behavior";
         }
 
-        else if (aboveChargingCount > belowChargingCount ||
-            meanVoltage > CHARGING_INSPECT_HIGH_MEAN)
+        else if (aboveChargingCount > belowChargingCount || meanVoltage > CHARGING_INSPECT_HIGH_MEAN)
         {
             chargingResults.condition = "High voltage behavior";
         }
@@ -4702,14 +4162,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
             if (chargingMeanLowStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%sAverage control-module voltage was %.2f V, below the %.2f V inspection threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     meanVoltage,
                     CHARGING_INSPECT_LOW_MEAN);
 
@@ -4719,14 +4182,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
             if (chargingMeanHighStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%sAverage control-module voltage was %.2f V, above the %.2f V inspection threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     meanVoltage,
                     CHARGING_INSPECT_HIGH_MEAN);
 
@@ -4736,14 +4202,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
             if (chargingLowCountStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%s%.0f of %u voltage readings were below %.1f V, meeting the %u-reading inspection threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     belowChargingCount,
                     static_cast<unsigned int>(CASE_SIZE),
                     CHARGING_INSPECT_LOW_MEAN,
@@ -4755,14 +4224,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
             if (chargingHighCountStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%s%.0f of %u voltage readings were above %.1f V, meeting the %u-reading inspection threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     aboveChargingCount,
                     static_cast<unsigned int>(CASE_SIZE),
                     CHARGING_INSPECT_HIGH_MEAN,
@@ -4774,14 +4246,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
             if (chargingStepStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%sVoltage changed by as much as %.2f V between consecutive readings, above the %.2f V inspection threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     maximumVoltageStep,
                     CHARGING_INSPECT_MAX_STEP);
 
@@ -4791,14 +4266,17 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
             if (chargingStepStdStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%sVariation between consecutive voltage changes was %.2f V, above the %.2f V inspection threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     voltageStepStandardDeviation,
                     CHARGING_INSPECT_STEP_STD);
 
@@ -4809,19 +4287,19 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             // Mild evidence is added only if there is room
             // --------------------------------------------------------
 
-            if (
-                chargingLowMild &&
-                !chargingLowCountStrong &&
-                evidenceItemsAdded < 3)
+            if (chargingLowMild && !chargingLowCountStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%s%.0f of %u voltage readings were below %.1f V, meeting the %u-reading monitoring threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     belowChargingCount,
                     static_cast<unsigned int>(CASE_SIZE),
                     CHARGING_INSPECT_LOW_MEAN,
@@ -4831,19 +4309,19 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             }
 
 
-            if (
-                chargingHighMild &&
-                !chargingHighCountStrong &&
-                evidenceItemsAdded < 3)
+            if (chargingHighMild && !chargingHighCountStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%s%.0f of %u voltage readings were above %.1f V, meeting the %u-reading monitoring threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     aboveChargingCount,
                     static_cast<unsigned int>(CASE_SIZE),
                     CHARGING_INSPECT_HIGH_MEAN,
@@ -4853,19 +4331,19 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             }
 
 
-            if (
-                chargingStepMild &&
-                !chargingStepStrong &&
-                evidenceItemsAdded < 3)
+            if (chargingStepMild && !chargingStepStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%sVoltage changed by as much as %.2f V between consecutive readings, above the %.2f V monitoring threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     maximumVoltageStep,
                     CHARGING_KEEP_MAX_STEP);
 
@@ -4873,19 +4351,19 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             }
 
 
-            if (
-                chargingStepStdMild &&
-                !chargingStepStdStrong &&
-                evidenceItemsAdded < 3)
+            if (chargingStepStdMild && !chargingStepStdStrong && evidenceItemsAdded < 3)
             {
-                size_t used =
-                    strlen(chargingResults.description);
+                size_t used = strlen(chargingResults.description);
+
+                const char* separator = "";
+
+                if (used > 0) separator = " ";
 
                 snprintf(
                     chargingResults.description + used,
                     sizeof(chargingResults.description) - used,
                     "%sVariation between consecutive voltage changes was %.2f V, above the %.2f V monitoring threshold.",
-                    used > 0 ? " " : "",
+                    separator,
                     voltageStepStandardDeviation,
                     CHARGING_KEEP_STEP_STD);
 
@@ -4946,19 +4424,22 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
     Serial.println(completedCase.samples[CASE_SIZE - 1].timestampMs);
 
     Serial.print("Fuel available: ");
-    Serial.println(completedCase.fuel.available ? "YES" : "NO");
+    if (completedCase.fuel.available) Serial.println("YES");
+    else Serial.println("NO");
 
     Serial.print("Fuel action level: ");
     Serial.println(completedCase.fuel.actionLevel);
 
     Serial.print("Catalyst available: ");
-    Serial.println(completedCase.catalyst.available ? "YES" : "NO");
+    if (completedCase.catalyst.available) Serial.println("YES");
+    else Serial.println("NO");
 
     Serial.print("Catalyst action level: ");
     Serial.println(completedCase.catalyst.actionLevel);
 
     Serial.print("Charging available: ");
-    Serial.println(completedCase.charging.available ? "YES" : "NO");
+    if (completedCase.charging.available) Serial.println("YES");
+    else Serial.println("NO");
 
     Serial.print("Charging action level: ");
     Serial.println(completedCase.charging.actionLevel);
@@ -5026,25 +4507,16 @@ void initializeBle()
     bleServer->setCallbacks(new PistonBleServerCallbacks());
 
 
-    BLEService* pistonService =
-        bleServer->createService(
-            BLE_SERVICE_UUID);
+    BLEService* pistonService = bleServer->createService(BLE_SERVICE_UUID);
 
 
-    bleTxCharacteristic =
-    pistonService->createCharacteristic(
-        BLE_TX_CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY);
+    bleTxCharacteristic = pistonService->createCharacteristic(BLE_TX_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_NOTIFY);
 
 
-    bleTxCharacteristic->addDescriptor(
-        new BLE2902());
+    bleTxCharacteristic->addDescriptor(new BLE2902());
 
 
-    bleRxCharacteristic =
-        pistonService->createCharacteristic(
-            BLE_RX_CHARACTERISTIC_UUID,
-            BLECharacteristic::PROPERTY_WRITE);
+    bleRxCharacteristic = pistonService->createCharacteristic(BLE_RX_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_WRITE);
 
 
     bleRxCharacteristic->setCallbacks(new PistonBleCommandCallbacks());
@@ -5053,11 +4525,9 @@ void initializeBle()
     pistonService->start();
 
 
-    BLEAdvertising* advertising =
-        BLEDevice::getAdvertising();
+    BLEAdvertising* advertising = BLEDevice::getAdvertising();
 
-    advertising->addServiceUUID(
-        BLE_SERVICE_UUID);
+    advertising->addServiceUUID(BLE_SERVICE_UUID);
 
     advertising->start();
 
@@ -5118,16 +4588,12 @@ void loop()
         // Always begin with a fresh case.
         sampleIndex = 0;
 
-        previousSampleTime =
-            millis() - SAMPLE_PERIOD_MS;
+        previousSampleTime = millis() - SAMPLE_PERIOD_MS;
 
         Serial.println();
-        Serial.println(
-            "P.I.S.T.O.N. logging STARTED.");
+        Serial.println("P.I.S.T.O.N. logging STARTED.");
 
-        sendJsonPayloadOverBle(
-            "{\"type\":\"logging_status\","
-            "\"enabled\":true}");
+        sendJsonPayloadOverBle("{\"type\":\"logging_status\"," "\"enabled\":true}");
     }
     else if (loggingCommand == LOGGING_COMMAND_PAUSE)
     {
@@ -5141,35 +4607,25 @@ void loop()
 
         if (bleDeviceConnected)
         {
-            sendJsonPayloadOverBle(
-                "{\"type\":\"logging_status\","
-                "\"enabled\":false}");
+            sendJsonPayloadOverBle("{\"type\":\"logging_status\"," "\"enabled\":false}");
         }
 
     }
-    else if (loggingCommand ==
-            LOGGING_COMMAND_STATUS)
+    else if (loggingCommand == LOGGING_COMMAND_STATUS)
     {
         if (loggingEnabled)
         {
-            sendJsonPayloadOverBle(
-                "{\"type\":\"logging_status\","
-                "\"enabled\":true}");
+            sendJsonPayloadOverBle("{\"type\":\"logging_status\"," "\"enabled\":true}");
         }
         else
         {
-            sendJsonPayloadOverBle(
-                "{\"type\":\"logging_status\","
-                "\"enabled\":false}");
+            sendJsonPayloadOverBle("{\"type\":\"logging_status\"," "\"enabled\":false}");
         }
 
-        Serial.print(
-            "Logging status sent: ");
+        Serial.print("Logging status sent: ");
 
-        Serial.println(
-            loggingEnabled
-                ? "ENABLED"
-                : "PAUSED");
+        if (loggingEnabled) Serial.println("ENABLED");
+        else Serial.println("PAUSED");
     }
 
     const bool dtcScanRequested = pendingDtcRequest.exchange(false);
@@ -5179,13 +4635,9 @@ void loop()
         if (loggingEnabled)
         {
             Serial.println();
-            Serial.println(
-                "DTC scan rejected: logging is active.");
+            Serial.println("DTC scan rejected: logging is active.");
 
-            sendJsonPayloadOverBle(
-                "{\"type\":\"dtc_result\","
-                "\"success\":false,"
-                "\"error\":\"Pause logging before scanning DTCs\"}");
+            sendJsonPayloadOverBle("{\"type\":\"dtc_result\"," "\"success\":false," "\"error\":\"Pause logging before scanning DTCs\"}");
         }
         else
         {
@@ -5193,27 +4645,19 @@ void loop()
         }
     }
 
-const bool vinReadRequested =
-    pendingVinRequest.exchange(false);
+    const bool vinReadRequested = pendingVinRequest.exchange(false);
 
-if (vinReadRequested)
-{
-    if (loggingEnabled)
+    if (vinReadRequested)
     {
-        Serial.println();
-        Serial.println(
-            "VIN read rejected: logging is active.");
+        if (loggingEnabled)
+        {
+            Serial.println();
+            Serial.println("VIN read rejected: logging is active.");
 
-        sendJsonPayloadOverBle(
-            "{\"type\":\"vehicle_info\","
-            "\"success\":false,"
-            "\"vin\":null,"
-            "\"error\":\"Pause logging before reading vehicle information\"}");
+            sendJsonPayloadOverBle("{\"type\":\"vehicle_info\"," "\"success\":false," "\"vin\":null," "\"error\":\"Pause logging before reading vehicle information\"}");
+        }
+        else performVehicleInfoReadAndSend();
     }
-
-    else performVehicleInfoReadAndSend();
-    
-}
 
     // P.I.S.T.O.N. powers on paused.
     if (!loggingEnabled)
