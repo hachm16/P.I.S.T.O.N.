@@ -121,6 +121,16 @@ constexpr float CHARGING_INSPECT_STEP_STD = 0.45f;
 constexpr uint8_t CHARGING_INSPECT_REQUIRED_CONSECUTIVE_CASES = 2;
 
 
+// RPM at or below this value is treated as an engine-stop or cranking state.
+// Normal charging-system voltage limits are not evaluated while the engine
+// is below this speed because the alternator is not in normal operation.
+constexpr float CHARGING_ENGINE_STOP_RPM_THRESHOLD = 300.0f;
+
+// After RPM returns above the engine-stop threshold, ignore the restart
+// sample and the following sample from charging diagnostic calculations.
+// With the current approximately one-second sampling period, this suppresses
+// roughly the first two seconds of the restart voltage transient.
+constexpr uint8_t CHARGING_RESTART_SUPPRESSION_SAMPLES = 2;
 
 
 // Vehicle sample structure
@@ -236,6 +246,24 @@ struct ChargingCaseFeatures
     float values[7];
 };
 
+// Stores charging measurements that are safe to use for the
+// rule-based diagnostic logic after engine-stop and restart
+// samples have been removed.
+struct ChargingDiagnosticContext
+{
+    bool ready;
+
+    bool engineStopDetected;
+    bool engineRestartDetected;
+
+    size_t evaluatedSampleCount;
+
+    float meanVoltage;
+    float belowChargingCount;
+    float aboveChargingCount;
+    float maximumAbsoluteStep;
+    float stepStandardDeviation;
+};
 
 // Stores catalyst calculations for one bank
 struct CatalystBankFeatures
@@ -364,6 +392,12 @@ uint32_t previousSampleTime = 0;
 // ECU response ID, starts at 0 until one responds
 uint32_t selectedEcuResponseId = 0;
 
+// Bank 2 availability is checked before logging begins.
+// "Known" is kept separate from hasBank2 so a failed
+// capability check is not mistaken for a single-bank engine.
+bool bank2AvailabilityKnown = false;
+bool hasBank2 = false;
+
 // Consecutive catalyst mirroring cases are tracked separately by bank
 uint8_t catalystB1MirroringConsecutiveCases = 0;
 uint8_t catalystB2MirroringConsecutiveCases = 0;
@@ -373,6 +407,9 @@ uint8_t catalystB2StrongMirroringConsecutiveCases = 0;
 
 uint8_t chargingStrongConsecutiveCases = 0;
 
+// Carries engine-stop/restart state across 20-sample case boundaries.
+bool chargingPreviousEngineStopped = false;
+uint8_t chargingRestartSuppressionSamplesRemaining = 0;
 
 // Identifies each completed 20-sample case during the current session
 uint32_t currentCaseId = 0;
@@ -563,7 +600,140 @@ bool requestMode01Pid(
     return false;
 }
 
+// Determines whether the connected ECU reports a second engine bank.
+// Positive evidence from either the fuel-trim support bitmap or the
+// oxygen-sensor configuration is enough to confirm Bank 2.
+void detectBank2Availability()
+{
+    bank2AvailabilityKnown = false;
+    hasBank2 = false;
 
+    bool bank2FuelTrimSupported = false;
+
+    bool pid13Supported = false;
+    bool pid1dSupported = false;
+
+    bool pid13ResponseReceived = false;
+    bool pid1dResponseReceived = false;
+
+    bool bank2Pid13SensorsPresent = false;
+    bool bank2Pid1dSensorsPresent = false;
+
+
+    // PID 00 returns four bytes describing which Service 01
+    // PIDs from 01 through 20 are supported by the ECU.
+    uint8_t supportedPids[4] = {};
+
+    bool pid00ResponseReceived = requestMode01Pid(0x00, supportedPids, 4);
+
+    if (pid00ResponseReceived)
+    {
+        // Byte A covers PIDs 01 through 08.
+        // Bit 0 represents PID 08, STFT Bank 2.
+        bool bank2StftSupported = (supportedPids[0] & 0x01) != 0;
+
+        // Byte B begins with PID 09 at bit 7.
+        // PID 09 is LTFT Bank 2.
+        bool bank2LtftSupported = (supportedPids[1] & 0x80) != 0;
+
+        bank2FuelTrimSupported = bank2StftSupported || bank2LtftSupported;
+
+
+        // Byte C covers PIDs 11 through 18.
+        // Bit 5 represents PID 13.
+        pid13Supported = (supportedPids[2] & 0x20) != 0;
+
+        // Byte D covers PIDs 19 through 20.
+        // Bit 3 represents PID 1D.
+        pid1dSupported = (supportedPids[3] & 0x08) != 0;
+    }
+
+
+    // PID 13 reports the installed oxygen sensors using
+    // the normal two-bank layout. Bits 4 through 7 are Bank 2.
+    if (!pid00ResponseReceived || pid13Supported)
+    {
+        uint8_t oxygenSensorsTwoBank[1] = {};
+
+        pid13ResponseReceived = requestMode01Pid(0x13, oxygenSensorsTwoBank, 1);
+
+        if (pid13ResponseReceived)
+        {
+            bank2Pid13SensorsPresent = (oxygenSensorsTwoBank[0] & 0xF0) != 0;
+        }
+    }
+
+
+    // PID 1D reports oxygen sensors using the four-bank layout.
+    // Bits 2 and 3 represent Bank 2 Sensor 1 and Bank 2 Sensor 2.
+    if (!pid00ResponseReceived || pid1dSupported)
+    {
+        uint8_t oxygenSensorsFourBank[1] = {};
+
+        pid1dResponseReceived = requestMode01Pid(0x1D, oxygenSensorsFourBank, 1);
+
+        if (pid1dResponseReceived)
+        {
+            bank2Pid1dSensorsPresent = (oxygenSensorsFourBank[0] & 0x0C) != 0;
+        }
+    }
+
+
+    // Any positive Bank 2 evidence confirms that the vehicle
+    // exposes a second OBD-II engine bank.
+    if (bank2FuelTrimSupported || bank2Pid13SensorsPresent || bank2Pid1dSensorsPresent)
+    {
+        hasBank2 = true;
+        bank2AvailabilityKnown = true;
+    }
+    else
+    {
+        // Only declare Bank 2 absent when the ECU support bitmap
+        // was successfully received and at least one supported
+        // oxygen-sensor layout was also successfully read.
+        bool oxygenSensorLayoutConfirmed = false;
+
+        if (pid13Supported && pid13ResponseReceived) oxygenSensorLayoutConfirmed = true;
+
+        if (pid1dSupported && pid1dResponseReceived) oxygenSensorLayoutConfirmed = true;
+
+        if (pid00ResponseReceived && oxygenSensorLayoutConfirmed)
+        {
+            hasBank2 = false;
+            bank2AvailabilityKnown = true;
+        }
+    }
+
+
+    Serial.println();
+    Serial.println("--- BANK 2 AVAILABILITY CHECK ---");
+
+    Serial.print("PID 00 response: ");
+
+    if (pid00ResponseReceived) Serial.println("YES");
+    else Serial.println("NO");
+
+    Serial.print("Bank 2 fuel-trim support: ");
+
+    if (bank2FuelTrimSupported) Serial.println("YES");
+    else Serial.println("NO");
+
+    Serial.print("PID 13 Bank 2 sensors: ");
+
+    if (bank2Pid13SensorsPresent) Serial.println("YES");
+    else Serial.println("NO");
+
+    Serial.print("PID 1D Bank 2 sensors: ");
+
+    if (bank2Pid1dSensorsPresent) Serial.println("YES");
+    else Serial.println("NO");
+
+    Serial.print("Bank 2 availability: ");
+
+    if (!bank2AvailabilityKnown) Serial.println("UNKNOWN");
+    else if (hasBank2) Serial.println("PRESENT");
+    else Serial.println("NOT PRESENT");
+}
  
 // OBD-II value decoding functions
 // ------------------------------------------------------------
@@ -1608,6 +1778,10 @@ void collectOneSample(VehicleSample& sample)
     // Temporary array used to hold up to four returned PID data bytes
     uint8_t data[4] = {};
 
+    // Continue requesting Bank 2 data when availability is unknown.
+    // Skip Bank 2 requests only when the vehicle has been
+    // positively identified as a single-bank vehicle.
+    bool shouldRequestBank2 = !bank2AvailabilityKnown || hasBank2;
 
     // PID 04: Calculated engine load
     if (requestMode01Pid(0x04, data, 1))
@@ -1635,7 +1809,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 08: Short-term fuel trim, Bank 2
     // Four-cylinder engines normally do not have Bank 2, so this PID may be unsupported on many vehicles
-    if (requestMode01Pid(0x08, data, 1))
+    if (shouldRequestBank2 && requestMode01Pid(0x08, data, 1))
     {
         sample.stftB2 = decodeFuelTrim(data[0]);
         sample.stftB2Valid = true;
@@ -1643,7 +1817,7 @@ void collectOneSample(VehicleSample& sample)
 
 
     // PID 09: Long-term fuel trim, Bank 2
-    if (requestMode01Pid(0x09, data, 1))
+    if (shouldRequestBank2 && requestMode01Pid(0x09, data, 1))
     {
         sample.ltftB2 = decodeFuelTrim(data[0]);
         sample.ltftB2Valid = true;
@@ -1680,7 +1854,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 18: O2 Sensor 5
     // In the normal two-bank layout this is Bank 2 Sensor 1, which is the upstream O2 sensor for Bank 2
-    if (requestMode01Pid(0x18, data, 2))
+    if (shouldRequestBank2 && requestMode01Pid(0x18, data, 2))
     {
         sample.o2B2S1Voltage = decodeNarrowbandO2Voltage(data[0]);
 
@@ -1690,7 +1864,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 19: O2 Sensor 6
     // In the normal two-bank layout this is Bank 2 Sensor 2, which is the downstream O2 sensor for Bank 2
-    if (requestMode01Pid(0x19, data, 2))
+    if (shouldRequestBank2 && requestMode01Pid(0x19, data, 2))
     {
         sample.o2B2S2Voltage = decodeNarrowbandO2Voltage(data[0]);
 
@@ -1728,7 +1902,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 28: Wideband O2 Sensor 5
     // Normally represents Bank 2 Sensor 1 in a two-bank layout
-    if (requestMode01Pid(0x28, data, 4))
+    if (shouldRequestBank2 && requestMode01Pid(0x28, data, 4))
     {
         sample.o2B2S1EquivalenceRatio = decodeWidebandEquivalenceRatio(data[0], data[1]);
 
@@ -1746,7 +1920,7 @@ void collectOneSample(VehicleSample& sample)
 
     // PID 29: Wideband O2 Sensor 6
     // Used as a fallback for Bank 2 downstream voltage when PID 19 was unavailable
-    if (!sample.o2B2S2VoltageValid && requestMode01Pid(0x29, data, 4))
+    if (shouldRequestBank2 && !sample.o2B2S2VoltageValid && requestMode01Pid(0x29, data, 4))
     {
         sample.o2B2S2Voltage = decodeWidebandVoltage(data[2], data[3]);
 
@@ -2683,6 +2857,191 @@ ChargingCaseFeatures calculateChargingFeatures(const VehicleSample samples[CASE_
     return result;
 }
 
+// Creates a second set of charging measurements used only by
+// the rule-based diagnostic logic. The Isolation Forest still
+// receives the original unmodified V4 charging features.
+ChargingDiagnosticContext calculateChargingDiagnosticContext(const VehicleSample samples[CASE_SIZE])
+{
+    ChargingDiagnosticContext result = {};
+
+    result.ready = false;
+
+    result.engineStopDetected = false;
+    result.engineRestartDetected = false;
+
+    result.evaluatedSampleCount = 0;
+
+    result.meanVoltage = NAN;
+    result.belowChargingCount = 0.0f;
+    result.aboveChargingCount = 0.0f;
+    result.maximumAbsoluteStep = 0.0f;
+    result.stepStandardDeviation = NAN;
+
+
+    double voltageSum = 0.0;
+
+    float voltageSteps[CASE_SIZE - 1];
+
+    size_t stepCount = 0;
+
+    double stepSum = 0.0;
+
+    bool previousSampleEligible = false;
+
+    float previousVoltage = NAN;
+
+
+    for (size_t i = 0; i < CASE_SIZE; i++)
+    {
+        const VehicleSample& sample = samples[i];
+
+        bool rpmAvailable = sample.rpmValid && isfinite(sample.rpm);
+
+        bool voltageAvailable = sample.controlModuleVoltageValid && isfinite(sample.controlModuleVoltage);
+
+
+        // Without RPM, the firmware cannot safely determine whether
+        // the engine is running or currently in an auto-stop state.
+        // Do not use that sample for rule-based charging decisions.
+        if (!rpmAvailable)
+        {
+            previousSampleEligible = false;
+            continue;
+        }
+
+
+        // RPM at or below the threshold means the engine is stopped
+        // or cranking. Battery-level voltage during this state is
+        // expected and must not be treated as low charging voltage.
+        if (sample.rpm <= CHARGING_ENGINE_STOP_RPM_THRESHOLD)
+        {
+            result.engineStopDetected = true;
+
+            chargingPreviousEngineStopped = true;
+
+            previousSampleEligible = false;
+
+            continue;
+        }
+
+
+        // The first running-RPM sample after an engine-stop state
+        // identifies an engine restart. Begin a short suppression
+        // period so the normal restart voltage transient is ignored.
+        if (chargingPreviousEngineStopped)
+        {
+            result.engineRestartDetected = true;
+
+            chargingPreviousEngineStopped = false;
+
+            chargingRestartSuppressionSamplesRemaining = CHARGING_RESTART_SUPPRESSION_SAMPLES;
+        }
+
+
+        // Ignore the restart sample and the configured number of
+        // restart-recovery samples before evaluating charging behavior.
+        if (chargingRestartSuppressionSamplesRemaining > 0)
+        {
+            chargingRestartSuppressionSamplesRemaining--;
+
+            previousSampleEligible = false;
+
+            continue;
+        }
+
+
+        if (!voltageAvailable)
+        {
+            previousSampleEligible = false;
+            continue;
+        }
+
+
+        float voltage = sample.controlModuleVoltage;
+
+        voltageSum += voltage;
+
+        result.evaluatedSampleCount++;
+
+
+        if (voltage < CHARGING_INSPECT_LOW_MEAN)
+        {
+            result.belowChargingCount++;
+        }
+
+
+        if (voltage > CHARGING_INSPECT_HIGH_MEAN)
+        {
+            result.aboveChargingCount++;
+        }
+
+
+        // Only calculate voltage steps between adjacent samples that
+        // were both eligible. This prevents comparing a pre-stop
+        // sample directly with a post-restart sample.
+        if (previousSampleEligible)
+        {
+            float currentStep = voltage - previousVoltage;
+
+            voltageSteps[stepCount] = currentStep;
+
+            float absoluteStep = fabs(currentStep);
+
+            if (absoluteStep > result.maximumAbsoluteStep)
+            {
+                result.maximumAbsoluteStep = absoluteStep;
+            }
+
+            stepSum += currentStep;
+
+            stepCount++;
+        }
+
+
+        previousVoltage = voltage;
+
+        previousSampleEligible = true;
+    }
+
+
+    // Use the same minimum-valid-sample requirement already used
+    // elsewhere in P.I.S.T.O.N. If auto-stop activity leaves too
+    // little steady engine-running data, the diagnostic logic waits
+    // for another case instead of making a charging fault decision.
+    if (result.evaluatedSampleCount < MIN_VALID_SAMPLES)
+    {
+        return result;
+    }
+
+
+    result.meanVoltage = static_cast<float>(voltageSum / result.evaluatedSampleCount);
+
+
+    if (stepCount == 0)
+    {
+        return result;
+    }
+
+
+    double meanStep = stepSum / stepCount;
+
+    double squaredStepDifferenceSum = 0.0;
+
+
+    for (size_t i = 0; i < stepCount; i++)
+    {
+        double difference = voltageSteps[i] - meanStep;
+
+        squaredStepDifferenceSum += difference * difference;
+    }
+
+
+    result.stepStandardDeviation = static_cast<float>(sqrt(squaredStepDifferenceSum / stepCount));
+
+    result.ready = true;
+
+    return result;
+}
 
 // Feature printing
 // ------------------------------------------------------------
@@ -2823,6 +3182,8 @@ void buildCompletedCaseJson(const CompletedCaseToTransmit& completedCase, JsonDo
     doc["type"] = "case_complete";
     doc["protocol_version"] = 1;
     doc["case_id"] = completedCase.caseId;
+    doc["bank2_availability_known"] = bank2AvailabilityKnown;
+    doc["has_bank_2"] = hasBank2;
 
 
     // Raw 20-sample case
@@ -3925,26 +4286,28 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         chargingResults.anomalyScore = chargingScore;
         chargingResults.anomalyAlert = chargingAlert;
 
-        float meanVoltage = chargingFeatures.values[0];
+        // Build a second set of charging measurements for the
+        // rule-based logic. These exclude engine-stop and restart
+        // transients while leaving the Isolation Forest untouched.
+        ChargingDiagnosticContext chargingContext = calculateChargingDiagnosticContext(samples);
 
-        float belowChargingCount = chargingFeatures.values[3];
+        float meanVoltage = chargingContext.meanVoltage;
 
-        float aboveChargingCount = chargingFeatures.values[4];
+        float belowChargingCount = chargingContext.belowChargingCount;
 
-        float maximumVoltageStep = chargingFeatures.values[5];
+        float aboveChargingCount = chargingContext.aboveChargingCount;
 
-        float voltageStepStandardDeviation = chargingFeatures.values[6];
+        float maximumVoltageStep = chargingContext.maximumAbsoluteStep;
 
+        float voltageStepStandardDeviation = chargingContext.stepStandardDeviation;
 
-        // Mild physical evidence
-        bool chargingLowMild = belowChargingCount >= CHARGING_KEEP_LOW_COUNT;
+        bool chargingLowMild = chargingContext.ready && belowChargingCount >= CHARGING_KEEP_LOW_COUNT;
 
-        bool chargingHighMild = aboveChargingCount >= CHARGING_KEEP_HIGH_COUNT;
+        bool chargingHighMild = chargingContext.ready && aboveChargingCount >= CHARGING_KEEP_HIGH_COUNT;
 
-        bool chargingStepMild = maximumVoltageStep >= CHARGING_KEEP_MAX_STEP;
+        bool chargingStepMild = chargingContext.ready && maximumVoltageStep >= CHARGING_KEEP_MAX_STEP;
 
-        bool chargingStepStdMild = voltageStepStandardDeviation >= CHARGING_KEEP_STEP_STD;
-
+        bool chargingStepStdMild = chargingContext.ready && voltageStepStandardDeviation >= CHARGING_KEEP_STEP_STD;
 
         uint8_t chargingMildEvidenceCount = 0;
 
@@ -3976,24 +4339,29 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
 
 
         // Strong physical evidence
-        bool chargingStrongPhysical =
+        bool chargingStrongPhysical = chargingContext.ready &&
+        (
             meanVoltage < CHARGING_INSPECT_LOW_MEAN ||
             meanVoltage > CHARGING_INSPECT_HIGH_MEAN ||
             belowChargingCount >= CHARGING_INSPECT_LOW_COUNT ||
-            aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT || maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP || voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
+            aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT ||
+            maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP ||
+            voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD
+        );
 
-        bool chargingMeanLowStrong = meanVoltage < CHARGING_INSPECT_LOW_MEAN;
+        bool chargingMeanLowStrong = chargingContext.ready && meanVoltage < CHARGING_INSPECT_LOW_MEAN;
 
-        bool chargingMeanHighStrong = meanVoltage > CHARGING_INSPECT_HIGH_MEAN;
+        bool chargingMeanHighStrong = chargingContext.ready && meanVoltage > CHARGING_INSPECT_HIGH_MEAN;
 
-        bool chargingLowCountStrong = belowChargingCount >= CHARGING_INSPECT_LOW_COUNT;
+        bool chargingLowCountStrong = chargingContext.ready && belowChargingCount >= CHARGING_INSPECT_LOW_COUNT;
 
-        bool chargingHighCountStrong = aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT;
+        bool chargingHighCountStrong = chargingContext.ready && aboveChargingCount >= CHARGING_INSPECT_HIGH_COUNT;
 
-        bool chargingStepStrong = maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP;
+        bool chargingStepStrong = chargingContext.ready && maximumVoltageStep >= CHARGING_INSPECT_MAX_STEP;
 
-        bool chargingStepStdStrong = voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
-
+        bool chargingStepStdStrong = chargingContext.ready && voltageStepStandardDeviation >= CHARGING_INSPECT_STEP_STD;
+        
+        
         // A strong charging case requires agreement between
         // the Isolation Forest and strong measured voltage behavior
         bool chargingStrongThisCase = chargingAlert && chargingStrongPhysical;
@@ -4060,6 +4428,42 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
             Serial.println("NO");
         }
 
+
+        Serial.print("Context-ready charging data: ");
+
+if (chargingContext.ready) Serial.println("YES");
+else Serial.println("NO");
+
+Serial.print("Evaluated running samples: ");
+Serial.println(chargingContext.evaluatedSampleCount);
+
+Serial.print("Engine stop detected: ");
+
+if (chargingContext.engineStopDetected) Serial.println("YES");
+else Serial.println("NO");
+
+Serial.print("Engine restart detected: ");
+
+if (chargingContext.engineRestartDetected) Serial.println("YES");
+else Serial.println("NO");
+
+        if (chargingContext.ready)
+        {
+            Serial.print("Context mean voltage: ");
+            Serial.println(meanVoltage, 6);
+
+            Serial.print("Context below-13.0 count: ");
+            Serial.println(belowChargingCount, 0);
+
+            Serial.print("Context above-14.8 count: ");
+            Serial.println(aboveChargingCount, 0);
+
+            Serial.print("Context maximum voltage step: ");
+            Serial.println(maximumVoltageStep, 6);
+
+            Serial.print("Context voltage-step STD: ");
+            Serial.println(voltageStepStandardDeviation, 6);
+        }
 
         Serial.print("Strong charging case: ");
 
@@ -4131,10 +4535,27 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
         // 10 - Isolation Forest only
         else if (chargingAlert && !chargingDiagnosticEvidence)
         {
-            snprintf(
-                chargingResults.description,
-                sizeof(chargingResults.description),
-                "The predictive model noticed a charging-voltage pattern that differed somewhat from learned normal behavior. Measured voltage levels and changes did not cross the configured monitoring limits, so the result remains Normal Operation.");
+            if (!chargingContext.ready && (chargingContext.engineStopDetected || chargingContext.engineRestartDetected))
+            {
+                snprintf(
+                    chargingResults.description,
+                    sizeof(chargingResults.description),
+                    "The predictive model noticed a charging-voltage pattern that differed from learned normal behavior. Engine stop or restart activity was also detected, so expected voltage changes around that event were excluded from the charging fault decision. There was not enough steady engine-running evidence to confirm a charging problem, so the result remains Normal Operation.");
+            }
+            else if (!chargingContext.ready)
+            {
+                snprintf(
+                    chargingResults.description,
+                    sizeof(chargingResults.description),
+                    "The predictive model noticed a charging-voltage pattern that differed from learned normal behavior. There was not enough valid steady engine-running data to confirm the pattern with the charging diagnostic logic, so the result remains Normal Operation.");
+            }
+            else
+            {
+                snprintf(
+                    chargingResults.description,
+                    sizeof(chargingResults.description),
+                    "The predictive model noticed a charging-voltage pattern that differed somewhat from learned normal behavior. Measured steady engine-running voltage did not cross the configured monitoring limits, so the result remains Normal Operation.");
+            }
         }
 
         // Diagnostic evidence exists: 01 or 11
@@ -4214,7 +4635,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                     "%s%.0f of %u voltage readings were below %.1f V, meeting the %u-reading inspection threshold.",
                     separator,
                     belowChargingCount,
-                    static_cast<unsigned int>(CASE_SIZE),
+                    static_cast<unsigned int>(chargingContext.evaluatedSampleCount),
                     CHARGING_INSPECT_LOW_MEAN,
                     static_cast<unsigned int>(CHARGING_INSPECT_LOW_COUNT));
 
@@ -4236,7 +4657,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                     "%s%.0f of %u voltage readings were above %.1f V, meeting the %u-reading inspection threshold.",
                     separator,
                     aboveChargingCount,
-                    static_cast<unsigned int>(CASE_SIZE),
+                    static_cast<unsigned int>(chargingContext.evaluatedSampleCount),
                     CHARGING_INSPECT_HIGH_MEAN,
                     static_cast<unsigned int>(CHARGING_INSPECT_HIGH_COUNT));
 
@@ -4301,7 +4722,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                     "%s%.0f of %u voltage readings were below %.1f V, meeting the %u-reading monitoring threshold.",
                     separator,
                     belowChargingCount,
-                    static_cast<unsigned int>(CASE_SIZE),
+                    static_cast<unsigned int>(chargingContext.evaluatedSampleCount),
                     CHARGING_INSPECT_LOW_MEAN,
                     static_cast<unsigned int>(CHARGING_KEEP_LOW_COUNT));
 
@@ -4323,7 +4744,7 @@ void processCompletedCase(const VehicleSample samples[CASE_SIZE])
                     "%s%.0f of %u voltage readings were above %.1f V, meeting the %u-reading monitoring threshold.",
                     separator,
                     aboveChargingCount,
-                    static_cast<unsigned int>(CASE_SIZE),
+                    static_cast<unsigned int>(chargingContext.evaluatedSampleCount),
                     CHARGING_INSPECT_HIGH_MEAN,
                     static_cast<unsigned int>(CHARGING_KEEP_HIGH_COUNT));
 
@@ -4583,6 +5004,17 @@ void loop()
 
     if (loggingCommand == LOGGING_COMMAND_START)
     {
+        // Determine the vehicle's Bank 2 configuration before
+        // beginning the first sample. If the check is inconclusive,
+        // it will be attempted again the next time logging starts.
+        if (!bank2AvailabilityKnown) detectBank2Availability();
+
+        // A new logging run starts a new charging-context timeline.
+        // Do not carry a possible engine-stop/restart state across
+        // a pause or disconnected period.
+        chargingPreviousEngineStopped = false;
+        chargingRestartSuppressionSamplesRemaining = 0;
+
         loggingEnabled = true;
 
         // Always begin with a fresh case.
