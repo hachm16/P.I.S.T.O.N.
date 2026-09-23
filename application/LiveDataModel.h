@@ -28,6 +28,8 @@ public:
         Qt::Orientation orientation,
         int role = Qt::DisplayRole) const override;
 
+    void setBank2Availability(bool known, bool hasBank2);
+
     void appendSamples(
         int caseId,
         const QJsonArray& samples);
@@ -42,4 +44,7 @@ private:
     };
 
     QVector<Row> m_rows;
+
+    bool m_bank2AvailabilityKnown = false;
+    bool m_hasBank2 = false;
 };
