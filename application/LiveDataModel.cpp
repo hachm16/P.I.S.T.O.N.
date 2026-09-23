@@ -48,6 +48,7 @@ int LiveDataModel::columnCount(
         return 0;
     }
 
+    if (m_bank2AvailabilityKnown && !m_hasBank2) return 11;
     return 16;
 }
 
@@ -91,19 +92,21 @@ QVariant LiveDataModel::headerData(
             "Case",
             "Sample",
             "Time (s)",
+            "RPM",
             "Engine Load (%)",
+            "Module Voltage (V)",
+
             "STFT B1 (%)",
             "LTFT B1 (%)",
-            "STFT B2 (%)",
-            "LTFT B2 (%)",
-            "RPM",
             "O2 B1S1 (V)",
             "O2 B1S2 (V)",
             "O2 B1S1 Eq",
+
+            "STFT B2 (%)",
+            "LTFT B2 (%)",
             "O2 B2S1 (V)",
             "O2 B2S2 (V)",
-            "O2 B2S1 Eq",
-            "Module Voltage (V)"
+            "O2 B2S1 Eq"
         };
 
     if (section < 0 ||
@@ -113,6 +116,21 @@ QVariant LiveDataModel::headerData(
     }
 
     return headers.at(section);
+}
+
+void LiveDataModel::setBank2Availability(bool known, bool hasBank2)
+{
+    if (m_bank2AvailabilityKnown == known && m_hasBank2 == hasBank2)
+    {
+        return;
+    }
+
+    beginResetModel();
+
+    m_bank2AvailabilityKnown = known;
+    m_hasBank2 = hasBank2;
+
+    endResetModel();
 }
 
 void LiveDataModel::appendSamples(
@@ -137,8 +155,7 @@ void LiveDataModel::appendSamples(
 
     for (const QJsonValue& sampleValue : samples)
     {
-        const QJsonObject sample =
-            sampleValue.toObject();
+        const QJsonObject sample = sampleValue.toObject();
 
         Row row;
 
@@ -150,15 +167,23 @@ void LiveDataModel::appendSamples(
                     sample,
                     "sample_index"),
 
-            sample.value("time_ms").isNull()
-                ? QVariant()
-                : QVariant(
-                      sample.value("time_ms").toDouble()
-                      / 1000.0),
+                sample.value("time_ms").isNull()
+                    ? QVariant()
+                    : QVariant(
+                          sample.value("time_ms").toDouble()
+                          / 1000.0),
+
+                jsonValueForDisplay(
+                    sample,
+                    "rpm"),
 
                 jsonValueForDisplay(
                     sample,
                     "engine_load"),
+
+                jsonValueForDisplay(
+                    sample,
+                    "control_module_voltage"),
 
                 jsonValueForDisplay(
                     sample,
@@ -167,18 +192,6 @@ void LiveDataModel::appendSamples(
                 jsonValueForDisplay(
                     sample,
                     "ltft_b1"),
-
-                jsonValueForDisplay(
-                    sample,
-                    "stft_b2"),
-
-                jsonValueForDisplay(
-                    sample,
-                    "ltft_b2"),
-
-                jsonValueForDisplay(
-                    sample,
-                    "rpm"),
 
                 jsonValueForDisplay(
                     sample,
@@ -194,6 +207,14 @@ void LiveDataModel::appendSamples(
 
                 jsonValueForDisplay(
                     sample,
+                    "stft_b2"),
+
+                jsonValueForDisplay(
+                    sample,
+                    "ltft_b2"),
+
+                jsonValueForDisplay(
+                    sample,
                     "o2_b2s1_voltage"),
 
                 jsonValueForDisplay(
@@ -202,11 +223,7 @@ void LiveDataModel::appendSamples(
 
                 jsonValueForDisplay(
                     sample,
-                    "o2_b2s1_equiv"),
-
-                jsonValueForDisplay(
-                    sample,
-                    "control_module_voltage")
+                    "o2_b2s1_equiv")
             };
 
         m_rows.append(row);
@@ -217,7 +234,7 @@ void LiveDataModel::appendSamples(
 
 void LiveDataModel::clear()
 {
-    if (m_rows.isEmpty())
+    if (m_rows.isEmpty() && !m_bank2AvailabilityKnown && !m_hasBank2)
     {
         return;
     }
@@ -225,6 +242,9 @@ void LiveDataModel::clear()
     beginResetModel();
 
     m_rows.clear();
+
+    m_bank2AvailabilityKnown = false;
+    m_hasBank2 = false;
 
     endResetModel();
 }
@@ -260,7 +280,7 @@ QString LiveDataModel::toCsv() const
     for (const Row& row : m_rows)
     {
         for (int column = 0;
-             column < row.values.size();
+             column < columnCount();
              ++column)
         {
             if (column > 0)
