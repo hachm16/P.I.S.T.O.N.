@@ -1657,6 +1657,19 @@ void PistonBackend::restoreCaseFromJson(
     // Raw samples
     // --------------------------------------------------------
 
+    const QJsonValue bank2KnownValue =
+        caseObject.value("bank2_availability_known");
+
+    const QJsonValue hasBank2Value =
+        caseObject.value("has_bank_2");
+
+    if (bank2KnownValue.isBool() && hasBank2Value.isBool())
+    {
+        m_liveDataModel->setBank2Availability(
+            bank2KnownValue.toBool(),
+            hasBank2Value.toBool());
+    }
+
     const QJsonArray samples =
         caseObject.value(
                       "samples").toArray();
@@ -3249,6 +3262,19 @@ void PistonBackend::onCharacteristicChanged(
         // --------------------------------------------------------
         // Raw samples
         // --------------------------------------------------------
+
+        const QJsonValue bank2KnownValue =
+            rootObject.value("bank2_availability_known");
+
+        const QJsonValue hasBank2Value =
+            rootObject.value("has_bank_2");
+
+        if (bank2KnownValue.isBool() && hasBank2Value.isBool())
+        {
+            m_liveDataModel->setBank2Availability(
+                bank2KnownValue.toBool(),
+                hasBank2Value.toBool());
+        }
 
         const QJsonArray samples =
             rootObject.value("samples").toArray();
