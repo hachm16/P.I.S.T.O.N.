@@ -262,3 +262,4 @@ private:
     DiagnosticHistoryModel* m_chargingHistoryModel = nullptr;
 
 };
+
